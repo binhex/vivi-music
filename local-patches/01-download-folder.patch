@@ -1,9 +1,9 @@
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..bba189d3
+index 00000000..fa9c04fa
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,260 @@
+@@ -0,0 +1,330 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -12,6 +12,7 @@ index 00000000..bba189d3
 +package com.music.vivi.playback
 +
 +import android.content.ContentUris
++import android.content.ContentResolver
 +import android.content.ContentValues
 +import android.content.Context
 +import android.net.Uri
@@ -33,6 +34,8 @@ index 00000000..bba189d3
 +import kotlinx.coroutines.CancellationException
 +import kotlinx.coroutines.Dispatchers
 +import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
 +import kotlinx.coroutines.withContext
 +import timber.log.Timber
 +import java.io.File
@@ -63,6 +66,9 @@ index 00000000..bba189d3
 +    private val database: MusicDatabase,
 +    @DownloadCache private val downloadCache: SimpleCache,
 +) {
++    /** Exports are small local copies; serialising them keeps a re-download from racing itself. */
++    private val exportMutex = Mutex()
++
 +    /**
 +     * Exports [songId] when the feature is enabled. Never throws: failures are logged and the cached
 +     * download stays intact.
@@ -70,47 +76,54 @@ index 00000000..bba189d3
 +    suspend fun export(songId: String) {
 +        withContext(Dispatchers.IO) {
 +            if (context.dataStore[DownloadFolderExportEnabledKey] == false) return@withContext
++            exportMutex.withLock { exportLocked(songId) }
++        }
++    }
 +
-+            val song = try {
-+                database.song(songId).first()
-+            } catch (e: CancellationException) {
-+                throw e
-+            } catch (e: Exception) {
-+                Timber.tag(TAG).w(e, "Could not read song %s", songId)
-+                null
-+            }
-+            if (song == null) {
-+                Timber.tag(TAG).w("No database row for %s, skipping export", songId)
-+                return@withContext
-+            }
++    private suspend fun exportLocked(songId: String) {
++        val song = try {
++            database.song(songId).first()
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            Timber.tag(TAG).w(e, "Could not read song %s", songId)
++            null
++        }
++        if (song == null) {
++            Timber.tag(TAG).w("No database row for %s, skipping export", songId)
++            return
++        }
 +
-+            val mimeType = song.format?.mimeType
-+                .orEmpty()
-+                .substringBefore(';')
-+                .trim()
-+                .ifEmpty { DEFAULT_MIME_TYPE }
-+            val fileName = buildFileName(song, mimeType)
++        val mimeType = song.format?.mimeType
++            .orEmpty()
++            .substringBefore(';')
++            .trim()
++            .ifEmpty { DEFAULT_MIME_TYPE }
++        val fileName = buildFileName(song, mimeType)
 +
-+            try {
-+                write(songId, fileName, mimeType)
-+                Timber.tag(TAG).i("Exported %s as %s", songId, fileName)
-+            } catch (e: CancellationException) {
-+                throw e
-+            } catch (e: Exception) {
-+                Timber.tag(TAG).e(e, "Export failed for %s, cached download is intact", songId)
-+            }
++        try {
++            write(songId, fileName, mimeType)
++            Timber.tag(TAG).i("Exported %s as %s", songId, fileName)
++        } catch (e: CancellationException) {
++            throw e
++        } catch (e: Exception) {
++            Timber.tag(TAG).e(e, "Export failed for %s, cached download is intact", songId)
 +        }
 +    }
 +
 +    private fun write(songId: String, fileName: String, mimeType: String) {
 +        val folderUri = context.dataStore[DownloadFolderUriKey].orEmpty()
 +        if (folderUri.isNotBlank()) {
-+            val treeUri = folderUri.toUri()
-+            if (SafFolders.canWrite(context, treeUri)) {
-+                writeToDocumentTree(treeUri, songId, fileName, mimeType)
++            try {
++                writeToDocumentTree(folderUri.toUri(), songId, fileName, mimeType)
 +                return
++            } catch (e: CancellationException) {
++                throw e
++            } catch (e: Exception) {
++                // A revoked grant or a folder that turned read-only must not lose the export: fall
++                // through to Music/Vivi instead of writing nothing at all.
++                Timber.tag(TAG).w(e, "Chosen folder failed, using Music/%s", SUBFOLDER)
 +            }
-+            Timber.tag(TAG).w("Chosen folder is not writable, falling back to Music/%s", SUBFOLDER)
 +        }
 +        writeToPublicMusic(songId, fileName, mimeType)
 +    }
@@ -147,19 +160,7 @@ index 00000000..bba189d3
 +        val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
 +        val relativePath = "${Environment.DIRECTORY_MUSIC}/$SUBFOLDER"
 +
-+        // Overwrite a previous export of the same song.
-+        resolver.query(
-+            collection,
-+            arrayOf(MediaStore.Audio.Media._ID),
-+            "${MediaStore.Audio.Media.DISPLAY_NAME} = ? AND ${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
-+            arrayOf(fileName, "$relativePath/"),
-+            null,
-+        )?.use { cursor ->
-+            if (cursor.moveToFirst()) {
-+                val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID))
-+                resolver.delete(ContentUris.withAppendedId(collection, id), null, null)
-+            }
-+        }
++        deleteOwnExports(resolver, collection, fileName, relativePath)
 +
 +        val uri = resolver.insert(
 +            collection,
@@ -175,15 +176,55 @@ index 00000000..bba189d3
 +            val output = resolver.openOutputStream(uri)
 +                ?: throw IOException("Could not open output stream for $uri")
 +            output.use { copyFromCache(songId, it) }
++        } catch (e: Exception) {
++            runCatching { resolver.delete(uri, null, null) }
++            throw e
++        }
++
++        // Publishing is best effort: failing to clear IS_PENDING must not delete a complete file.
++        runCatching {
 +            resolver.update(
 +                uri,
 +                ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) },
 +                null,
 +                null,
 +            )
-+        } catch (e: Exception) {
-+            runCatching { resolver.delete(uri, null, null) }
-+            throw e
++        }.onFailure { Timber.tag(TAG).w(it, "Could not publish %s", fileName) }
++    }
++
++    /**
++     * Removes this app's previous export of the same song so the new file can take the name.
++     *
++     * Only rows this package owns are deleted - a same-named file from another app is not ours, and
++     * MediaStore renames ours instead of overwriting it - and a refused delete is logged rather than
++     * failing the export.
++     */
++    @RequiresApi(Build.VERSION_CODES.Q)
++    private fun deleteOwnExports(
++        resolver: ContentResolver,
++        collection: Uri,
++        fileName: String,
++        relativePath: String,
++    ) {
++        val ownedIds = mutableListOf<Long>()
++        runCatching {
++            resolver.query(
++                collection,
++                arrayOf(MediaStore.Audio.Media._ID, MediaStore.MediaColumns.OWNER_PACKAGE_NAME),
++                "${MediaStore.Audio.Media.DISPLAY_NAME} = ? AND " +
++                    "${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
++                arrayOf(fileName, "$relativePath/"),
++                null,
++            )?.use { cursor ->
++                while (cursor.moveToNext()) {
++                    if (cursor.getString(1) == context.packageName) ownedIds += cursor.getLong(0)
++                }
++            }
++        }.onFailure { Timber.tag(TAG).w(it, "Could not look up a previous export of %s", fileName) }
++
++        ownedIds.forEach { id ->
++            runCatching { resolver.delete(ContentUris.withAppendedId(collection, id), null, null) }
++                .onFailure { Timber.tag(TAG).w(it, "Could not replace the previous export of %s", fileName) }
 +        }
 +    }
 +
@@ -192,9 +233,14 @@ index 00000000..bba189d3
 +     * hidden yet on these versions, so the app-specific external directory is still user-visible.
 +     */
 +    private fun writeToAppSpecificMusicDir(songId: String, fileName: String) {
-+        val base = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC) ?: context.filesDir
-+        val directory = File(base, SUBFOLDER)
-+        directory.mkdirs()
++        val base = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
++        if (base == null) {
++            Timber.tag(TAG).w("External music directory unavailable, using internal storage")
++        }
++        val directory = File(base ?: context.filesDir, SUBFOLDER)
++        if (!directory.exists() && !directory.mkdirs()) {
++            Timber.tag(TAG).w("Could not create %s", directory)
++        }
 +        val file = File(directory, fileName)
 +        try {
 +            file.outputStream().use { copyFromCache(songId, it) }
@@ -205,27 +251,35 @@ index 00000000..bba189d3
 +    }
 +
 +    /**
-+     * Reads the finished download straight out of the download cache. A null upstream means a cache
-+     * miss fails fast instead of silently re-downloading.
++     * Reads the finished download straight out of the download cache.
++     *
++     * The request is bounded to the bytes the cache actually holds: a null upstream means "the cache
++     * contains everything requested", so reading past that point would be an error rather than the
++     * end of the stream.
 +     */
 +    private fun copyFromCache(songId: String, output: OutputStream) {
++        val expected = downloadCache.getCachedBytes(songId, 0, Long.MAX_VALUE)
++        if (expected <= 0L) throw IOException("Nothing cached for $songId")
++
 +        val dataSource = CacheDataSource(downloadCache, null)
 +        try {
-+            val length = dataSource.open(
++            dataSource.open(
 +                DataSpec.Builder()
 +                    .setUri(songId.toUri())
 +                    .setKey(songId)
++                    .setLength(expected)
 +                    .build(),
 +            )
 +            var total = 0L
 +            val buffer = ByteArray(BUFFER_SIZE)
-+            while (true) {
-+                val read = dataSource.read(buffer, 0, buffer.size)
-+                if (read == -1) break
++            while (total < expected) {
++                val request = minOf(buffer.size.toLong(), expected - total).toInt()
++                val read = dataSource.read(buffer, 0, request)
++                if (read <= 0) break
 +                output.write(buffer, 0, read)
 +                total += read
 +            }
-+            if (total <= 0L) throw IOException("Nothing cached for $songId (open returned $length)")
++            if (total != expected) throw IOException("Copied $total of $expected cached bytes for $songId")
 +        } finally {
 +            runCatching { dataSource.close() }
 +        }
@@ -233,7 +287,12 @@ index 00000000..bba189d3
 +
 +    private fun buildFileName(song: Song, mimeType: String): String {
 +        val artist = song.artists.joinToString(", ") { it.name }.ifBlank { UNKNOWN_ARTIST }
-+        return "${sanitizeFileName(artist)} - ${sanitizeFileName(song.song.title)}${extensionFor(mimeType)}"
++        val extension = extensionFor(mimeType)
++        val base = truncateToBytes(
++            sanitizeFileName("$artist - ${song.song.title}"),
++            MAX_NAME_BYTES - extension.length,
++        ).trimEnd('.', ' ')
++        return "${base.ifBlank { song.song.id }}$extension"
 +    }
 +
 +    private fun extensionFor(mimeType: String): String = when {
@@ -250,7 +309,18 @@ index 00000000..bba189d3
 +        .replace(INVALID_FILE_CHARS, "_")
 +        .replace(WHITESPACE, " ")
 +        .trim()
-+        .take(MAX_NAME_LENGTH)
++
++    /**
++     * Filesystems limit a name to 255 bytes, not characters: a 120-character CJK or Cyrillic title is
++     * three times that and would otherwise fail the export with nothing but a log line.
++     */
++    private fun truncateToBytes(name: String, maxBytes: Int): String {
++        if (name.toByteArray(Charsets.UTF_8).size <= maxBytes) return name
++        var end = name.length
++        while (end > 0 && name.substring(0, end).toByteArray(Charsets.UTF_8).size > maxBytes) end--
++        val truncated = name.substring(0, end)
++        return if (truncated.isNotEmpty() && truncated.last().isHighSurrogate()) truncated.dropLast(1) else truncated
++    }
 +
 +    private companion object {
 +        const val TAG = "DownloadFolderExporter"
@@ -259,7 +329,7 @@ index 00000000..bba189d3
 +        const val UNKNOWN_ARTIST = "Unknown Artist"
 +        const val OPEN_MODE_TRUNCATE = "wt"
 +        const val BUFFER_SIZE = 64 * 1024
-+        const val MAX_NAME_LENGTH = 120
++        const val MAX_NAME_BYTES = 200
 +        val INVALID_FILE_CHARS = Regex("[\\\\/:*?\"<>|]")
 +        val WHITESPACE = Regex("\\s+")
 +    }
@@ -313,10 +383,10 @@ index 00000000..40c13961
 +val DownloadFolderUriKey = stringPreferencesKey("downloadFolderUri")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 new file mode 100644
-index 00000000..151d5b57
+index 00000000..d0a3aa70
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,105 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -335,20 +405,18 @@ index 00000000..151d5b57
 + *
 + * Hand-rolled instead of using `androidx.documentfile`, which is a thin wrapper over exactly these
 + * calls: that keeps the patch dependency-free, so it never has to touch the Gradle files either.
++ *
++ * Everything here addresses documents through `buildDocumentUriUsingTree`, never the bare
++ * `content://.../tree/<id>` URI that `ACTION_OPEN_DOCUMENT_TREE` hands back: a tree URI on its own
++ * matches none of the URI shapes `DocumentsProvider.query()` serves, so querying it throws.
 + */
 +internal object SafFolders {
 +
-+    /** Display name of the picked folder, or null when the permission is gone. */
++    /** Display name of the picked folder, or null when the grant is gone or the folder is unreadable. */
 +    fun displayName(context: Context, treeUri: Uri): String? =
-+        query(context, treeUri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) { cursor ->
-+            cursor.getString(0)
++        query(context, documentUri(treeUri), arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) {
++            it.getString(0)
 +        }
-+
-+    /** True while the tree still grants write access; the user can revoke it at any time. */
-+    fun canWrite(context: Context, treeUri: Uri): Boolean =
-+        query(context, treeUri, arrayOf(DocumentsContract.Document.COLUMN_FLAGS)) { cursor ->
-+            cursor.getInt(0) and DocumentsContract.Document.FLAG_SUPPORTS_WRITE != 0
-+        } ?: false
 +
 +    /**
 +     * Returns a writable document URI for [displayName] inside the tree, replacing an existing file
@@ -426,10 +494,10 @@ index 00000000..151d5b57
 +}
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..6862a84d
+index 00000000..98c2b585
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,140 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -437,6 +505,7 @@ index 00000000..6862a84d
 +
 +package com.music.vivi.ui.screens.settings
 +
++import android.content.Context
 +import android.content.Intent
 +import androidx.activity.compose.rememberLauncherForActivityResult
 +import androidx.activity.result.contract.ActivityResultContracts
@@ -477,18 +546,14 @@ index 00000000..6862a84d
 +    val (folderUri, onFolderUriChange) = rememberPreference(DownloadFolderUriKey, "")
 +
 +    var folderName by remember(folderUri) { mutableStateOf<String?>(null) }
-+    var folderWritable by remember(folderUri) { mutableStateOf(false) }
 +
-+    // Resolving the display name touches the documents provider, so keep it off the main thread.
++    // Resolving the display name touches the documents provider, so keep it off the main thread. A
++    // null result is how a revoked grant shows up: the provider throws, and SafFolders reports null.
 +    LaunchedEffect(folderUri) {
 +        folderName = null
-+        folderWritable = false
 +        if (folderUri.isNotBlank()) {
 +            withContext(Dispatchers.IO) {
-+                val treeUri = folderUri.toUri()
-+                val name = SafFolders.displayName(context, treeUri)
-+                folderName = name
-+                folderWritable = name != null && SafFolders.canWrite(context, treeUri)
++                folderName = SafFolders.displayName(context, folderUri.toUri())
 +            }
 +        }
 +    }
@@ -503,6 +568,8 @@ index 00000000..6862a84d
 +                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
 +                    )
 +                }.onFailure { Timber.tag(TAG).w(it, "Could not persist folder permission") }
++                // Switching folders must not leak the previous persisted grant.
++                releasePersistedPermission(context, folderUri)
 +                onFolderUriChange(uri.toString())
 +            }
 +        }
@@ -521,10 +588,8 @@ index 00000000..6862a84d
 +                                !exportEnabled -> stringResource(R.string.download_folder_off)
 +                                folderUri.isBlank() ->
 +                                    stringResource(R.string.download_folder_default)
-+                                folderWritable && name != null ->
-+                                    stringResource(R.string.download_folder_current, name)
-+                                else ->
-+                                    stringResource(R.string.download_folder_permission_lost)
++                                name != null -> stringResource(R.string.download_folder_current, name)
++                                else -> stringResource(R.string.download_folder_permission_lost)
 +                            },
 +                        )
 +                    },
@@ -552,13 +617,7 @@ index 00000000..6862a84d
 +                        icon = painterResource(R.drawable.clear_all),
 +                        title = { Text(stringResource(R.string.download_folder_reset)) },
 +                        onClick = {
-+                            runCatching {
-+                                context.contentResolver.releasePersistableUriPermission(
-+                                    folderUri.toUri(),
-+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
-+                                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-+                                )
-+                            }
++                            releasePersistedPermission(context, folderUri)
 +                            onFolderUriChange("")
 +                        },
 +                    ),
@@ -566,6 +625,16 @@ index 00000000..6862a84d
 +            }
 +        },
 +    )
++}
++
++private fun releasePersistedPermission(context: Context, folderUri: String) {
++    if (folderUri.isBlank()) return
++    runCatching {
++        context.contentResolver.releasePersistableUriPermission(
++            folderUri.toUri(),
++            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
++        )
++    }
 +}
 +
 +private const val TAG = "LocalDownloadSettings"
