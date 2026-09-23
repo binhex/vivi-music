@@ -1,9 +1,21 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index cd1b6155..d5091c1c 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -224,6 +224,7 @@ dependencies {
+     implementation(libs.guava)
+     implementation(libs.coroutines.guava)
+     implementation(libs.concurrent.futures)
++    testImplementation(libs.junit)
+ 
+     implementation(libs.activity)
+     implementation(libs.hilt.navigation)
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..c2dbc095
+index 00000000..4f3cb9ca
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,391 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -94,11 +106,16 @@ index 00000000..c2dbc095
 +            return
 +        }
 +
++        val template = context.dataStore[DownloadFolderTemplateKey] ?: FolderTemplate.DEFAULT_TEMPLATE
++
 +        try {
++            val input = song.toTemplateInput()
 +            val mimeType = sniffMimeType(songId)
-+                ?: song.format?.mimeType.orEmpty().substringBefore(';').trim().ifEmpty { DEFAULT_MIME_TYPE }
-+            val fileName = buildFileName(song, mimeType)
-+            write(songId, fileName, mimeType)
++                ?: song.format?.mimeType.orEmpty().substringBefore(';').trim()
++                    .ifEmpty { FolderTemplate.DEFAULT_MIME_TYPE }
++            val fileName = FolderTemplate.fileName(input, mimeType)
++            val segments = FolderTemplate.expand(input, template)
++            write(songId, fileName, mimeType, segments)
 +            Timber.tag(TAG).i("Exported %s as %s", songId, fileName)
 +        } catch (e: CancellationException) {
 +            throw e
@@ -107,11 +124,11 @@ index 00000000..c2dbc095
 +        }
 +    }
 +
-+    private fun write(songId: String, fileName: String, mimeType: String) {
++    private fun write(songId: String, fileName: String, mimeType: String, segments: List<String>) {
 +        val folderUri = context.dataStore[DownloadFolderUriKey].orEmpty()
 +        if (folderUri.isNotBlank()) {
 +            try {
-+                writeToDocumentTree(folderUri.toUri(), songId, fileName, mimeType)
++                writeToDocumentTree(folderUri.toUri(), songId, fileName, mimeType, segments)
 +                return
 +            } catch (e: CancellationException) {
 +                throw e
@@ -121,7 +138,7 @@ index 00000000..c2dbc095
 +                Timber.tag(TAG).w(e, "Chosen folder failed, using Music/%s", SUBFOLDER)
 +            }
 +        }
-+        writeToPublicMusic(songId, fileName, mimeType)
++        writeToPublicMusic(songId, fileName, mimeType, segments)
 +    }
 +
 +    /**
@@ -133,11 +150,13 @@ index 00000000..c2dbc095
 +        songId: String,
 +        fileName: String,
 +        mimeType: String,
++        segments: List<String>,
 +    ) {
-+        val existing = SafFolders.findFile(context, treeUri, fileName)
++        val directory = SafFolders.resolveDirectory(context, treeUri, segments)
++        val existing = SafFolders.findFile(context, treeUri, directory, fileName)
 +        val target = if (existing == null) fileName else "$fileName$PART_SUFFIX"
-+        val uri = SafFolders.createFile(context, treeUri, mimeType, target)
-+            ?: throw IOException("Could not create $target in $treeUri")
++        val uri = SafFolders.createFile(context, directory, mimeType, target)
++            ?: throw IOException("Could not create $target in $directory")
 +        try {
 +            val output = context.contentResolver.openOutputStream(uri, OPEN_MODE_TRUNCATE)
 +                ?: throw IOException("Could not open output stream for $uri")
@@ -154,19 +173,32 @@ index 00000000..c2dbc095
 +        }
 +    }
 +
-+    private fun writeToPublicMusic(songId: String, fileName: String, mimeType: String) {
++    private fun writeToPublicMusic(
++        songId: String,
++        fileName: String,
++        mimeType: String,
++        segments: List<String>,
++    ) {
 +        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-+            writeToAppSpecificMusicDir(songId, fileName)
++            writeToAppSpecificMusicDir(songId, fileName, segments)
 +        } else {
-+            writeViaMediaStore(songId, fileName, mimeType)
++            writeViaMediaStore(songId, fileName, mimeType, segments)
 +        }
 +    }
 +
 +    @RequiresApi(Build.VERSION_CODES.Q)
-+    private fun writeViaMediaStore(songId: String, fileName: String, mimeType: String) {
++    private fun writeViaMediaStore(
++        songId: String,
++        fileName: String,
++        mimeType: String,
++        segments: List<String>,
++    ) {
 +        val resolver = context.contentResolver
 +        val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-+        val relativePath = "${Environment.DIRECTORY_MUSIC}/$SUBFOLDER"
++        val relativePath = buildString {
++            append(Environment.DIRECTORY_MUSIC).append('/').append(SUBFOLDER)
++            segments.forEach { append('/').append(it) }
++        }
 +
 +        deleteOwnExports(resolver, collection, fileName, relativePath)
 +
@@ -240,12 +272,12 @@ index 00000000..c2dbc095
 +     * API 26-28: no MediaStore write without a runtime storage permission, but `Android/data` is not
 +     * hidden yet on these versions, so the app-specific external directory is still user-visible.
 +     */
-+    private fun writeToAppSpecificMusicDir(songId: String, fileName: String) {
++    private fun writeToAppSpecificMusicDir(songId: String, fileName: String, segments: List<String>) {
 +        val base = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
 +        if (base == null) {
 +            Timber.tag(TAG).w("External music directory unavailable, using internal storage")
 +        }
-+        val directory = File(base ?: context.filesDir, SUBFOLDER)
++        val directory = File(base ?: context.filesDir, (listOf(SUBFOLDER) + segments).joinToString("/"))
 +        if (!directory.exists() && !directory.mkdirs()) {
 +            Timber.tag(TAG).w("Could not create %s", directory)
 +        }
@@ -355,58 +387,26 @@ index 00000000..c2dbc095
 +        return expected.indices.all { bytes[offset + it] == expected[it].code.toByte() }
 +    }
 +
-+    private fun buildFileName(song: Song, mimeType: String): String {
-+        val artist = song.artists.joinToString(", ") { it.name }.ifBlank { UNKNOWN_ARTIST }
-+        val extension = extensionFor(mimeType)
-+        val base = truncateToBytes(
-+            sanitizeFileName("$artist - ${song.song.title}"),
-+            MAX_NAME_BYTES - extension.length,
-+        ).trimEnd('.', ' ')
-+        return "${base.ifBlank { song.song.id }}$extension"
-+    }
-+
-+    private fun extensionFor(mimeType: String): String = when {
-+        mimeType.contains("webm") -> ".webm"
-+        mimeType.contains("mp4") || mimeType.contains("aac") -> ".m4a"
-+        mimeType.contains("mpeg") -> ".mp3"
-+        mimeType.contains("opus") -> ".opus"
-+        mimeType.contains("ogg") -> ".ogg"
-+        mimeType.contains("flac") -> ".flac"
-+        else -> ".m4a"
-+    }
-+
-+    private fun sanitizeFileName(name: String): String = name
-+        .replace(INVALID_FILE_CHARS, "_")
-+        .replace(WHITESPACE, " ")
-+        .trim()
-+
-+    /**
-+     * Filesystems limit a name to 255 bytes, not characters: a 120-character CJK or Cyrillic title is
-+     * three times that and would otherwise fail the export with nothing but a log line.
-+     */
-+    private fun truncateToBytes(name: String, maxBytes: Int): String {
-+        if (name.toByteArray(Charsets.UTF_8).size <= maxBytes) return name
-+        var end = name.length
-+        while (end > 0 && name.substring(0, end).toByteArray(Charsets.UTF_8).size > maxBytes) end--
-+        val truncated = name.substring(0, end)
-+        return if (truncated.isNotEmpty() && truncated.last().isHighSurrogate()) truncated.dropLast(1) else truncated
-+    }
-+
 +    private companion object {
 +        const val TAG = "DownloadFolderExporter"
 +        const val SUBFOLDER = "Vivi"
-+        const val DEFAULT_MIME_TYPE = "audio/mp4"
-+        const val UNKNOWN_ARTIST = "Unknown Artist"
 +        const val OPEN_MODE_TRUNCATE = "wt"
 +        const val PART_SUFFIX = ".part"
 +        const val BUFFER_SIZE = 64 * 1024
-+        const val MAX_NAME_BYTES = 200
 +        const val MAGIC_SIZE = 12
 +        val EBML = byteArrayOf(0x1A, 0x45, 0xDF.toByte(), 0xA3.toByte())
-+        val INVALID_FILE_CHARS = Regex("[\\\\/:*?\"<>|]")
-+        val WHITESPACE = Regex("\\s+")
 +    }
 +}
++
++/** Maps a library row onto the metadata the template can resolve. */
++internal fun Song.toTemplateInput() = FolderTemplate.Input(
++    songId = id,
++    title = song.title,
++    artists = artists.map { it.name },
++    album = album?.title ?: song.albumName,
++    year = song.year ?: album?.year,
++    bitrate = format?.bitrate,
++)
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt
 index df48f9bb..d3725f5b 100644
 --- a/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt
@@ -427,12 +427,158 @@ index df48f9bb..d3725f5b 100644
                                  }
                                  Download.STATE_FAILED,
                                  Download.STATE_STOPPED,
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
+new file mode 100644
+index 00000000..95fd9e83
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
+@@ -0,0 +1,140 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++/**
++ * Turns the download folder structure template into sanitised path segments, and composes the file name
++ * for an export.
++ *
++ * Deliberately pure Kotlin with no Android or database imports: these are the rules that decide where a
++ * file lands on disk, including the traversal safety, so they are unit-tested directly.
++ */
++object FolderTemplate {
++
++    /** Organise downloads by artist and album unless the user says otherwise. */
++    const val DEFAULT_TEMPLATE = "%artist%/%album%"
++
++    /** A pathological template must not be able to build an unbounded tree. */
++    const val MAX_SEGMENTS = 6
++
++    /** Filesystems cap a single name at 255 bytes; leave room for the extension. */
++    const val MAX_SEGMENT_BYTES = 200
++
++    /** The same budget applies to a composed file name. */
++    const val MAX_FILE_NAME_BYTES = 200
++
++    const val DEFAULT_MIME_TYPE = "audio/mp4"
++
++    /** Tokens offered as chips in the editor, in display order. */
++    val TOKENS = listOf("%artist%", "%album%", "%year%", "%title%", "%songId%", "%quality%")
++
++    private val SUPPORTED = setOf("artist", "album", "year", "title", "songid", "quality")
++    private val TOKEN_PATTERN = Regex("%([A-Za-z]+)%")
++    private val INVALID_CHARS = Regex("[\\\\/:*?\"<>|]")
++    private val WHITESPACE = Regex("\\s+")
++
++    private const val UNKNOWN_ARTIST = "Unknown Artist"
++    private const val UNKNOWN_ALBUM = "Unknown Album"
++    private const val UNKNOWN_YEAR = "Unknown Year"
++    private const val UNKNOWN_QUALITY = "Unknown Quality"
++
++    /** The metadata a template can resolve, decoupled from the database entities. */
++    data class Input(
++        val songId: String,
++        val title: String?,
++        val artists: List<String>,
++        val album: String?,
++        val year: Int?,
++        val bitrate: Int?,
++    )
++
++    /** Validation outcome for the settings editor. */
++    data class ParseResult(
++        val unknownTokens: List<String>,
++        val tooDeep: Boolean,
++    ) {
++        val isValid: Boolean get() = unknownTokens.isEmpty()
++    }
++
++    /** Reports tokens the app cannot resolve, plus whether the template is deeper than [MAX_SEGMENTS]. */
++    fun parse(template: String): ParseResult {
++        val segments = normalise(template)
++        val unknown = segments
++            .flatMap { segment -> TOKEN_PATTERN.findAll(segment).map { it.groupValues[1].lowercase() } }
++            .filterNot { it in SUPPORTED }
++            .distinct()
++        return ParseResult(unknown, segments.count { it.isNotBlank() } > MAX_SEGMENTS)
++    }
++
++    /** Resolves [template] into the folder segments to create below the download root. */
++    fun expand(input: Input, template: String): List<String> = normalise(template)
++        .map { segment -> TOKEN_PATTERN.replace(segment) { resolve(it.groupValues[1].lowercase(), input) } }
++        .map(::sanitizeSegment)
++        .filter { it.isNotEmpty() }
++        .take(MAX_SEGMENTS)
++
++    /** `Artist - Title.ext`, the name the exporter has always written. */
++    fun fileName(input: Input, mimeType: String?): String {
++        val extension = extensionFor(mimeType)
++        val artist = input.artists.joinToString(", ").ifBlank { UNKNOWN_ARTIST }
++        val title = input.title.orEmpty().ifBlank { input.songId }
++        val base = truncateToBytes(
++            sanitizeSegment("$artist - $title"),
++            MAX_FILE_NAME_BYTES - extension.length,
++        ).trimEnd('.', ' ')
++        return "${base.ifBlank { input.songId }}$extension"
++    }
++
++    internal fun extensionFor(mimeType: String?): String {
++        val type = mimeType.orEmpty().substringBefore(';').trim().ifEmpty { DEFAULT_MIME_TYPE }
++        return when {
++            type.contains("webm") -> ".webm"
++            type.contains("mp4") || type.contains("aac") -> ".m4a"
++            type.contains("mpeg") -> ".mp3"
++            type.contains("opus") -> ".opus"
++            type.contains("ogg") -> ".ogg"
++            type.contains("flac") -> ".flac"
++            else -> ".m4a"
++        }
++    }
++
++    private fun resolve(token: String, input: Input): String = when (token) {
++        "artist" -> input.artists.joinToString(", ").ifBlank { UNKNOWN_ARTIST }
++        "album" -> input.album.orEmpty().ifBlank { UNKNOWN_ALBUM }
++        "year" -> input.year?.toString() ?: UNKNOWN_YEAR
++        "title" -> input.title.orEmpty().ifBlank { input.songId }
++        "songid" -> input.songId
++        "quality" -> input.bitrate?.takeIf { it > 0 }?.let { "${it / 1000}kbps" } ?: UNKNOWN_QUALITY
++        else -> "%$token%"
++    }
++
++    /**
++     * One path segment, safe to use as a folder or file name: separators and other invalid characters
++     * become `_`, whitespace collapses, trailing dots and spaces go (invalid on FAT/exFAT), and a segment
++     * that is empty or only dots is dropped - which is what makes `..` impossible as a segment.
++     */
++    internal fun sanitizeSegment(segment: String): String {
++        val cleaned = segment
++            .replace(INVALID_CHARS, "_")
++            .replace(WHITESPACE, " ")
++            .trim()
++            .trimEnd('.', ' ')
++        if (cleaned.isEmpty() || cleaned.all { it == '.' }) return ""
++        return truncateToBytes(cleaned, MAX_SEGMENT_BYTES)
++    }
++
++    /** Filesystems limit a name to 255 bytes, not characters: a CJK title is three times its length. */
++    internal fun truncateToBytes(name: String, maxBytes: Int): String {
++        if (name.toByteArray(Charsets.UTF_8).size <= maxBytes) return name
++        var end = name.length
++        while (end > 0 && name.substring(0, end).toByteArray(Charsets.UTF_8).size > maxBytes) end--
++        val truncated = name.substring(0, end)
++        return if (truncated.isNotEmpty() && truncated.last().isHighSurrogate()) truncated.dropLast(1) else truncated
++    }
++
++    /** Backslash is a path separator too, so a Windows-style template behaves the same. */
++    private fun normalise(template: String): List<String> = template.replace('\\', '/').split('/')
++}
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt b/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt
 new file mode 100644
-index 00000000..40c13961
+index 00000000..c918728c
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,24 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -454,12 +600,15 @@ index 00000000..40c13961
 +
 +/** Storage Access Framework tree URI of the folder the user picked, or empty for `Music/Vivi`. */
 +val DownloadFolderUriKey = stringPreferencesKey("downloadFolderUri")
++
++/** Folder structure template such as `%artist%/%album%`; empty means flat. */
++val DownloadFolderTemplateKey = stringPreferencesKey("downloadFolderTemplate")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 new file mode 100644
-index 00000000..7f96b589
+index 00000000..9532418c
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,127 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -492,11 +641,36 @@ index 00000000..7f96b589
 +        }
 +    }.getOrNull()
 +
-+    /** URI of the file called [displayName] directly inside the tree, or null when there is none. */
-+    fun findFile(context: Context, treeUri: Uri, displayName: String): Uri? = runCatching {
++    /**
++     * Walks [segments] below the tree root, creating the directories that are missing, and returns the
++     * deepest directory it could reach.
++     *
++     * A name that already exists as a file stops the walk rather than creating a "Name (1)" directory
++     * beside it, so the export lands one level up instead.
++     */
++    fun resolveDirectory(context: Context, treeUri: Uri, segments: List<String>): Uri {
++        var parent = documentUri(treeUri)
++        for (segment in segments) {
++            val existing = findFile(context, treeUri, parent, segment)
++            val next = when {
++                existing == null -> createDirectory(context, parent, segment)
++                isDirectory(context, existing) -> existing
++                else -> null
++            }
++            if (next == null) return parent
++            parent = next
++        }
++        return parent
++    }
++
++    /** URI of the child called [displayName] directly inside [parent], or null when there is none. */
++    fun findFile(context: Context, treeUri: Uri, parent: Uri, displayName: String): Uri? = runCatching {
 +        query(
 +            context,
-+            childrenUri(treeUri),
++            DocumentsContract.buildChildDocumentsUriUsingTree(
++                treeUri,
++                DocumentsContract.getDocumentId(parent),
++            ),
 +            arrayOf(
 +                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
 +                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
@@ -514,16 +688,26 @@ index 00000000..7f96b589
 +        }
 +    }.getOrNull()
 +
-+    /** Creates a file called [displayName] directly inside the tree, or null when the folder refuses. */
-+    fun createFile(context: Context, treeUri: Uri, mimeType: String, displayName: String): Uri? =
++    /** Creates a file called [displayName] directly inside [parent], or null when the folder refuses. */
++    fun createFile(context: Context, parent: Uri, mimeType: String, displayName: String): Uri? =
++        runCatching {
++            DocumentsContract.createDocument(context.contentResolver, parent, mimeType, displayName)
++        }.getOrNull()
++
++    private fun createDirectory(context: Context, parent: Uri, displayName: String): Uri? =
 +        runCatching {
 +            DocumentsContract.createDocument(
 +                context.contentResolver,
-+                documentUri(treeUri),
-+                mimeType,
++                parent,
++                DocumentsContract.Document.MIME_TYPE_DIR,
 +                displayName,
 +            )
 +        }.getOrNull()
++
++    private fun isDirectory(context: Context, uri: Uri): Boolean =
++        query(context, uri, arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE)) { cursor ->
++            cursor.getString(0) == DocumentsContract.Document.MIME_TYPE_DIR
++        } ?: false
 +
 +    /** Best-effort rename; null means the provider does not support renaming. */
 +    fun rename(context: Context, documentUri: Uri, displayName: String): Uri? = runCatching {
@@ -534,12 +718,6 @@ index 00000000..7f96b589
 +    fun delete(context: Context, documentUri: Uri) {
 +        runCatching { DocumentsContract.deleteDocument(context.contentResolver, documentUri) }
 +    }
-+
-+    private fun childrenUri(treeUri: Uri): Uri =
-+        DocumentsContract.buildChildDocumentsUriUsingTree(
-+            treeUri,
-+            DocumentsContract.getTreeDocumentId(treeUri),
-+        )
 +
 +    private fun documentUri(treeUri: Uri): Uri =
 +        DocumentsContract.buildDocumentUriUsingTree(
@@ -560,10 +738,10 @@ index 00000000..7f96b589
 +}
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..2aa6b165
+index 00000000..f900df6e
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,302 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -575,6 +753,14 @@ index 00000000..2aa6b165
 +import android.content.Intent
 +import androidx.activity.compose.rememberLauncherForActivityResult
 +import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.FlowRow
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.AssistChip
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
 +import androidx.compose.material3.Switch
 +import androidx.compose.material3.Text
 +import androidx.compose.runtime.Composable
@@ -583,18 +769,29 @@ index 00000000..2aa6b165
 +import androidx.compose.runtime.mutableStateOf
 +import androidx.compose.runtime.remember
 +import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
 +import androidx.compose.ui.platform.LocalContext
 +import androidx.compose.ui.res.painterResource
 +import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.text.TextRange
++import androidx.compose.ui.text.input.TextFieldValue
++import androidx.compose.ui.unit.dp
 +import androidx.core.net.toUri
++import com.music.vivi.LocalDatabase
 +import com.music.vivi.R
++import com.music.vivi.db.entities.Song
 +import com.music.vivi.playback.DownloadFolderExportEnabledKey
++import com.music.vivi.playback.DownloadFolderTemplateKey
 +import com.music.vivi.playback.DownloadFolderUriKey
++import com.music.vivi.playback.FolderTemplate
 +import com.music.vivi.playback.SafFolders
++import com.music.vivi.playback.toTemplateInput
++import com.music.vivi.ui.component.ActionPromptDialog
 +import com.music.vivi.ui.component.ExpressiveSettingGroup
 +import com.music.vivi.ui.component.Material3SettingsItem
 +import com.music.vivi.utils.rememberPreference
 +import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.flow.first
 +import kotlinx.coroutines.isActive
 +import kotlinx.coroutines.withContext
 +import timber.log.Timber
@@ -611,6 +808,18 @@ index 00000000..2aa6b165
 +    val (exportEnabled, onExportEnabledChange) =
 +        rememberPreference(DownloadFolderExportEnabledKey, true)
 +    val (folderUri, onFolderUriChange) = rememberPreference(DownloadFolderUriKey, "")
++    val database = LocalDatabase.current
++    val (template, onTemplateChange) =
++        rememberPreference(DownloadFolderTemplateKey, FolderTemplate.DEFAULT_TEMPLATE)
++    var editingTemplate by remember { mutableStateOf(false) }
++    var sampleSong by remember { mutableStateOf<Song?>(null) }
++
++    // A real downloaded song makes the preview honest; the library may be empty.
++    LaunchedEffect(Unit) {
++        sampleSong = withContext(Dispatchers.IO) {
++            database.downloadedSongsByCreateDateAsc().first().lastOrNull()
++        }
++    }
 +
 +    var folderName by remember(folderUri) { mutableStateOf<String?>(null) }
 +    var resolving by remember(folderUri) { mutableStateOf(false) }
@@ -689,6 +898,20 @@ index 00000000..2aa6b165
 +                        onClick = { pickFolder.launch(null) },
 +                    ),
 +                )
++                add(
++                    Material3SettingsItem(
++                        icon = painterResource(R.drawable.list),
++                        title = { Text(stringResource(R.string.download_folder_structure)) },
++                        description = {
++                            Text(
++                                text = template.ifBlank {
++                                    stringResource(R.string.download_folder_structure_flat)
++                                },
++                            )
++                        },
++                        onClick = { editingTemplate = true },
++                    ),
++                )
 +            }
 +            if (folderUri.isNotBlank()) {
 +                add(
@@ -704,6 +927,19 @@ index 00000000..2aa6b165
 +            }
 +        },
 +    )
++
++    if (editingTemplate) {
++        FolderStructureDialog(
++            template = template,
++            rootLabel = folderName ?: stringResource(R.string.download_folder_default_root),
++            sampleSong = sampleSong,
++            onDismiss = { editingTemplate = false },
++            onSave = {
++                onTemplateChange(it)
++                editingTemplate = false
++            },
++        )
++    }
 +}
 +
 +private fun releasePersistedPermission(context: Context, folderUri: String) {
@@ -714,6 +950,97 @@ index 00000000..2aa6b165
 +            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
 +        )
 +    }
++}
++
++@Composable
++private fun FolderStructureDialog(
++    template: String,
++    rootLabel: String,
++    sampleSong: Song?,
++    onDismiss: () -> Unit,
++    onSave: (String) -> Unit,
++) {
++    var draft by remember { mutableStateOf(TextFieldValue(template)) }
++    val result = FolderTemplate.parse(draft.text)
++
++    // The example keeps the preview meaningful on a fresh install with nothing downloaded yet.
++    val example = FolderTemplate.Input(
++        songId = "dQw4w9WgXcQ",
++        title = "Enter Sandman",
++        artists = listOf("Metallica"),
++        album = "Master Of Puppets",
++        year = 1986,
++        bitrate = 256_000,
++    )
++    val previewInput = sampleSong?.toTemplateInput() ?: example
++    val previewName = FolderTemplate.fileName(previewInput, sampleSong?.format?.mimeType)
++    val preview = (listOf(rootLabel) + FolderTemplate.expand(previewInput, draft.text) + previewName)
++        .joinToString("/")
++
++    ActionPromptDialog(
++        title = stringResource(R.string.download_folder_structure),
++        onDismiss = onDismiss,
++        onConfirm = { if (result.isValid) onSave(draft.text) },
++        onReset = { draft = TextFieldValue(FolderTemplate.DEFAULT_TEMPLATE) },
++        onCancel = onDismiss,
++    ) {
++        OutlinedTextField(
++            value = draft,
++            onValueChange = { draft = it },
++            modifier = Modifier.fillMaxWidth(),
++            singleLine = true,
++            isError = !result.isValid,
++            label = { Text(stringResource(R.string.download_folder_structure)) },
++        )
++        if (result.unknownTokens.isNotEmpty()) {
++            Text(
++                text = stringResource(
++                    R.string.download_folder_structure_unknown_token,
++                    result.unknownTokens.joinToString(", ") { "%$it%" },
++                ),
++                color = MaterialTheme.colorScheme.error,
++                style = MaterialTheme.typography.bodySmall,
++            )
++        } else if (result.tooDeep) {
++            Text(
++                text = stringResource(R.string.download_folder_structure_too_deep),
++                style = MaterialTheme.typography.bodySmall,
++            )
++        }
++        FlowRow(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            FolderTemplate.TOKENS.forEach { token ->
++                AssistChip(
++                    onClick = { draft = draft.insertAtCursor(token) },
++                    label = { Text(token) },
++                )
++            }
++        }
++        Column(modifier = Modifier.fillMaxWidth()) {
++            Text(
++                text = stringResource(R.string.download_folder_structure_preview),
++                style = MaterialTheme.typography.labelLarge,
++            )
++            Text(text = preview, style = MaterialTheme.typography.bodySmall)
++            Text(
++                text = stringResource(R.string.download_folder_structure_hint),
++                modifier = Modifier.padding(top = 8.dp),
++                style = MaterialTheme.typography.bodySmall,
++            )
++        }
++    }
++}
++
++private fun TextFieldValue.insertAtCursor(text: String): TextFieldValue {
++    // A backwards selection reports start after end, which replaceRange would reject.
++    val start = minOf(selection.start, selection.end).coerceAtLeast(0)
++    val end = maxOf(selection.start, selection.end).coerceAtLeast(0)
++    return copy(
++        text = this.text.replaceRange(start, end, text),
++        selection = TextRange(start + text.length),
++    )
 +}
 +
 +private const val TAG = "LocalDownloadSettings"
@@ -732,10 +1059,10 @@ index aa40ee3e..19d47e14 100644
              items = listOf(
 diff --git a/app/src/main/res/values/local_download_strings.xml b/app/src/main/res/values/local_download_strings.xml
 new file mode 100644
-index 00000000..a52033fa
+index 00000000..a862f1c1
 --- /dev/null
 +++ b/app/src/main/res/values/local_download_strings.xml
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,24 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!--
 +  Strings for the "save downloads to a folder" patch.
@@ -752,4 +1079,214 @@ index 00000000..a52033fa
 +    <string name="download_folder_checking">Checking folder access...</string>
 +    <string name="download_folder_off">Disabled, downloads stay hidden in the app cache</string>
 +    <string name="download_folder_permission_lost">Folder access lost, using Music/Vivi. Choose the folder again.</string>
++    <string name="download_folder_structure">Folder structure</string>
++    <string name="download_folder_structure_flat">Flat - save directly in the chosen folder</string>
++    <string name="download_folder_structure_hint">Use the tokens below, separated by /. Leave empty to save directly in the chosen folder.</string>
++    <string name="download_folder_structure_preview">Preview</string>
++    <string name="download_folder_structure_unknown_token">Unknown token: %1$s</string>
++    <string name="download_folder_structure_too_deep">Only the first 6 folders are used</string>
++    <string name="download_folder_default_root">Music/Vivi</string>
 +</resources>
+diff --git a/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
+new file mode 100644
+index 00000000..5cc63ea4
+--- /dev/null
++++ b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
+@@ -0,0 +1,197 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class FolderTemplateTest {
++
++    private fun input(
++        songId: String = "dQw4w9WgXcQ",
++        title: String? = "Enter Sandman",
++        artists: List<String> = listOf("Metallica"),
++        album: String? = "Master Of Puppets",
++        year: Int? = 1986,
++        bitrate: Int? = 256_000,
++    ) = FolderTemplate.Input(songId, title, artists, album, year, bitrate)
++
++    @Test
++    fun `parse reports unknown tokens`() {
++        val result = FolderTemplate.parse("%artist%/%genre%/%bogus%")
++        assertEquals(listOf("genre", "bogus"), result.unknownTokens)
++        assertFalse(result.isValid)
++    }
++
++    @Test
++    fun `parse accepts the default template`() {
++        assertTrue(FolderTemplate.parse(FolderTemplate.DEFAULT_TEMPLATE).isValid)
++    }
++
++    @Test
++    fun `parse is case insensitive`() {
++        assertTrue(FolderTemplate.parse("%ARTIST%/%Album%").isValid)
++    }
++
++    @Test
++    fun `parse flags a too deep template without invalidating it`() {
++        val result = FolderTemplate.parse((1..7).joinToString("/") { "%artist%" })
++        assertTrue(result.tooDeep)
++        assertTrue(result.isValid)
++    }
++
++    @Test
++    fun `artist and album become segments`() {
++        assertEquals(
++            listOf("Metallica", "Master Of Puppets"),
++            FolderTemplate.expand(input(), "%artist%/%album%"),
++        )
++    }
++
++    @Test
++    fun `every supported token resolves`() {
++        assertEquals(
++            listOf("Metallica", "Master Of Puppets", "1986", "Enter Sandman", "dQw4w9WgXcQ", "256kbps"),
++            FolderTemplate.expand(input(), "%artist%/%album%/%year%/%title%/%songId%/%quality%"),
++        )
++    }
++
++    @Test
++    fun `tokens are case insensitive when expanding`() {
++        assertEquals(listOf("Metallica"), FolderTemplate.expand(input(), "%ARTIST%"))
++    }
++
++    @Test
++    fun `unknown token is kept literally`() {
++        assertEquals(listOf("%genre%"), FolderTemplate.expand(input(), "%genre%"))
++    }
++
++    @Test
++    fun `missing artist falls back`() {
++        assertEquals(listOf("Unknown Artist"), FolderTemplate.expand(input(artists = emptyList()), "%artist%"))
++    }
++
++    @Test
++    fun `missing album falls back`() {
++        assertEquals(listOf("Unknown Album"), FolderTemplate.expand(input(album = null), "%album%"))
++    }
++
++    @Test
++    fun `missing year falls back`() {
++        assertEquals(listOf("Unknown Year"), FolderTemplate.expand(input(year = null), "%year%"))
++    }
++
++    @Test
++    fun `missing bitrate falls back`() {
++        assertEquals(listOf("Unknown Quality"), FolderTemplate.expand(input(bitrate = null), "%quality%"))
++        assertEquals(listOf("Unknown Quality"), FolderTemplate.expand(input(bitrate = 0), "%quality%"))
++    }
++
++    @Test
++    fun `blank title falls back to the song id`() {
++        assertEquals(listOf("dQw4w9WgXcQ"), FolderTemplate.expand(input(title = "  "), "%title%"))
++    }
++
++    @Test
++    fun `multiple artists are joined`() {
++        assertEquals(
++            listOf("Metallica, Jason Newsted"),
++            FolderTemplate.expand(input(artists = listOf("Metallica", "Jason Newsted")), "%artist%"),
++        )
++    }
++
++    @Test
++    fun `a slash inside a resolved value stays in one segment`() {
++        assertEquals(listOf("AC_DC"), FolderTemplate.expand(input(artists = listOf("AC/DC")), "%artist%"))
++    }
++
++    @Test
++    fun `backslash separates segments`() {
++        assertEquals(
++            listOf("Metallica", "Master Of Puppets"),
++            FolderTemplate.expand(input(), "%artist%\\%album%"),
++        )
++    }
++
++    @Test
++    fun `empty template produces no segments`() {
++        assertTrue(FolderTemplate.expand(input(), "").isEmpty())
++        assertTrue(FolderTemplate.expand(input(), "  /  ").isEmpty())
++    }
++
++    @Test
++    fun `dots only segment is dropped`() {
++        assertTrue(FolderTemplate.expand(input(title = ".."), "%title%").isEmpty())
++        assertTrue(FolderTemplate.expand(input(title = "."), "%title%").isEmpty())
++    }
++
++    @Test
++    fun `absolute looking template stays relative`() {
++        assertEquals(listOf("etc", "Metallica"), FolderTemplate.expand(input(), "/etc/%artist%"))
++    }
++
++    @Test
++    fun `trailing dots and spaces are stripped`() {
++        assertEquals(listOf("Metallica"), FolderTemplate.expand(input(artists = listOf("Metallica. ")), "%artist%"))
++    }
++
++    @Test
++    fun `invalid characters are replaced`() {
++        assertEquals(
++            listOf("a_b_c_d_e_f_g_h_i"),
++            FolderTemplate.expand(input(artists = listOf("a/b:c*d?e\"f<g>h|i")), "%artist%"),
++        )
++    }
++
++    @Test
++    fun `whitespace is collapsed`() {
++        assertEquals(listOf("The Band"), FolderTemplate.expand(input(artists = listOf("The    Band")), "%artist%"))
++    }
++
++    @Test
++    fun `segments are capped at six`() {
++        val template = (1..8).joinToString("/") { "%artist%" }
++        assertEquals(6, FolderTemplate.expand(input(), template).size)
++    }
++
++    @Test
++    fun `segments are capped at 200 bytes`() {
++        val segment = FolderTemplate.expand(input(artists = listOf("ア".repeat(300))), "%artist%").single()
++        assertTrue(segment.toByteArray(Charsets.UTF_8).size <= 200)
++    }
++
++    @Test
++    fun `a dot file name is still allowed`() {
++        assertEquals(listOf(".nomedia"), FolderTemplate.expand(input(title = ".nomedia"), "%title%"))
++    }
++
++    @Test
++    fun `file name keeps the artist title shape`() {
++        assertEquals("Metallica - Enter Sandman.m4a", FolderTemplate.fileName(input(), "audio/mp4"))
++    }
++
++    @Test
++    fun `file name extension follows the mime type`() {
++        assertEquals("Metallica - Enter Sandman.webm", FolderTemplate.fileName(input(), "audio/webm; codecs=opus"))
++        assertEquals("Metallica - Enter Sandman.mp3", FolderTemplate.fileName(input(), "audio/mpeg"))
++        assertEquals("Metallica - Enter Sandman.ogg", FolderTemplate.fileName(input(), "audio/ogg"))
++        assertEquals("Metallica - Enter Sandman.flac", FolderTemplate.fileName(input(), "audio/flac"))
++        assertEquals("Metallica - Enter Sandman.m4a", FolderTemplate.fileName(input(), null))
++    }
++
++    @Test
++    fun `file name falls back to the song id for a blank title`() {
++        assertEquals("Metallica - dQw4w9WgXcQ.m4a", FolderTemplate.fileName(input(title = " "), "audio/mp4"))
++    }
++
++    @Test
++    fun `file name stays inside the byte budget`() {
++        val name = FolderTemplate.fileName(input(artists = listOf("ア".repeat(200))), "audio/mp4")
++        assertTrue(name.toByteArray(Charsets.UTF_8).size <= 200)
++    }
++}

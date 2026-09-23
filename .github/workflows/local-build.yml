@@ -119,6 +119,13 @@ jobs:
           ./gradlew --console=plain --no-configuration-cache \
             "assemble${{ steps.inputs.outputs.variant }}"
 
+      - name: Run unit tests
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ./gradlew --console=plain --no-configuration-cache \
+            "test${{ steps.inputs.outputs.variant }}UnitTest"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
