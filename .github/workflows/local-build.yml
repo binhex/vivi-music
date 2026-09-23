@@ -64,6 +64,10 @@ jobs:
           set -euo pipefail
           "${GITHUB_WORKSPACE}/patches/local-patches/apply.sh"
 
+      - name: Grant execute permission for gradlew
+        working-directory: src
+        run: chmod +x gradlew
+
       - name: Resolve build inputs
         id: inputs
         working-directory: src
