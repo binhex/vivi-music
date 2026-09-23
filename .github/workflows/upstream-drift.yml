@@ -1,0 +1,73 @@
+name: Upstream Drift Check
+
+# Cheap weekly canary: do local-patches/*.patch still apply to upstream main?
+#
+# A red run means upstream moved one of the few lines a patch touches (or added a file with the same
+# name) - the moment to rebase the patch, rather than finding out when a build is needed.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    name: Patches still apply to upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out patch set
+        uses: actions/checkout@v4
+        with:
+          path: patches
+
+      - name: Check out upstream main
+        uses: actions/checkout@v4
+        with:
+          repository: vivizzz007/vivi-music
+          ref: main
+          path: src
+
+      - name: Apply patches in dry-run mode
+        id: check
+        working-directory: src
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse --short HEAD)" >>"${GITHUB_OUTPUT}"
+          "${GITHUB_WORKSPACE}/patches/local-patches/apply.sh" --check
+
+      - name: Report drift
+        if: steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream_sha="${{ steps.check.outputs.sha }}"
+          {
+            echo "### Upstream drift detected"
+            echo
+            echo "\`local-patches/apply.sh --check\` failed against upstream main (\`${upstream_sha}\`)."
+            echo
+            echo "Rebase the patch onto the new upstream main and regenerate it - see"
+            echo "\`local-patches/README.md\`."
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+          title="Upstream drift: local patches no longer apply"
+          body="\`local-patches/apply.sh --check\` failed against upstream main (\`${upstream_sha}\`)."$'\n\n'"Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search 'Upstream drift in:title' --json number --jq '.[0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+          fi
+
+      - name: Fail the run so the drift is visible
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "Patches no longer apply to upstream main - see the job summary." >&2
+          exit 1

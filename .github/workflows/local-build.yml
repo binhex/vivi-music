@@ -1,0 +1,149 @@
+name: Local Patch Build
+
+# Builds an installable APK from upstream main + local-patches/*.patch.
+#
+# This fork only ever *adds* files, so `git merge upstream/main` never conflicts. If a patch stops
+# applying because upstream moved, this workflow fails loudly instead of producing a stale APK.
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: Product flavor to build
+        type: choice
+        options:
+          - foss
+          - gms
+        default: foss
+      upstream_ref:
+        description: Upstream ref to build against
+        type: string
+        default: main
+  push:
+    branches: [main]
+    paths:
+      - 'local-patches/**'
+      - '.github/workflows/local-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ inputs.flavor || 'foss' }} debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FLAVOR: ${{ inputs.flavor || 'foss' }}
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+    steps:
+      - name: Check out patch set
+        uses: actions/checkout@v4
+        with:
+          path: patches
+
+      - name: Check out upstream ${{ env.UPSTREAM_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: vivizzz007/vivi-music
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Apply local patches
+        working-directory: src
+        run: |
+          set -euo pipefail
+          "${GITHUB_WORKSPACE}/patches/local-patches/apply.sh"
+
+      - name: Resolve build inputs
+        id: inputs
+        working-directory: src
+        run: |
+          set -euo pipefail
+          flavor_cap="$(tr '[:lower:]' '[:upper:]' <<<"${FLAVOR:0:1}")${FLAVOR:1}"
+          {
+            echo "variant=Universal${flavor_cap}Debug"
+            echo "dir=universal${flavor_cap}"
+            echo "sha=$(git rev-parse --short HEAD)"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Summarise what is being built
+        working-directory: src
+        run: |
+          set -euo pipefail
+          {
+            echo "### Local patch build"
+            echo
+            echo "| input | value |"
+            echo "| --- | --- |"
+            echo "| upstream | \`vivizzz007/vivi-music@${UPSTREAM_REF}\` (\`${{ steps.inputs.outputs.sha }}\`) |"
+            echo "| task | \`assemble${{ steps.inputs.outputs.variant }}\` |"
+            echo "| patches | $(ls "${GITHUB_WORKSPACE}/patches/local-patches"/*.patch | xargs -n1 basename | paste -sd', ' -) |"
+            echo
+            echo '```'
+            git diff --stat
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Generate debug keystore
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.android"
+          keytool -genkey -v \
+            -keystore "${HOME}/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Build APK
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ./gradlew --console=plain --no-configuration-cache \
+            "assemble${{ steps.inputs.outputs.variant }}"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivi-${{ env.FLAVOR }}-debug-${{ steps.inputs.outputs.sha }}
+          path: src/app/build/outputs/apk/${{ steps.inputs.outputs.dir }}/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record APK checksum
+        run: |
+          set -euo pipefail
+          sha256sum src/app/build/outputs/apk/${{ steps.inputs.outputs.dir }}/debug/*.apk \
+            | tee -a "${GITHUB_STEP_SUMMARY}"
+
+      # Report only: upstream sets abortOnError=false, so lint never fails the build, but its report
+      # is the quickest way to see API-level mistakes in a patch.
+      - name: Lint
+        working-directory: src
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ./gradlew --console=plain --no-configuration-cache \
+            "lint${{ steps.inputs.outputs.variant }}"
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-${{ env.FLAVOR }}-${{ steps.inputs.outputs.sha }}
+          path: src/app/build/reports/lint-results-*
+          if-no-files-found: ignore
+          retention-days: 30
