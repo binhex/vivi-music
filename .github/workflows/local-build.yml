@@ -126,6 +126,28 @@ jobs:
           ./gradlew --console=plain --no-configuration-cache \
             "test${{ steps.inputs.outputs.variant }}UnitTest"
 
+      # Coverage gate for the JVM-testable code (Kover, min 95% line coverage on the filtered scope).
+      - name: Verify coverage
+        working-directory: src
+        run: |
+          set -euo pipefail
+          ./gradlew --console=plain --no-configuration-cache tasks --all | grep -i kover || true
+          report_task="$(./gradlew --console=plain --no-configuration-cache tasks --all | grep -oE 'koverXmlReport[A-Za-z]*' | head -1)"
+          verify_task="$(./gradlew --console=plain --no-configuration-cache tasks --all | grep -oE 'koverVerify[A-Za-z]*' | head -1)"
+          echo "kover report task: ${report_task:-none} / verify task: ${verify_task:-none}"
+          ./gradlew --console=plain --no-configuration-cache ${report_task} ${verify_task}
+          report="$(find . -path '*reports/kover/report.xml' | head -1)"
+          echo "kover xml report: ${report:-none}"
+          python3 - "${report}" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          xml = open(path).read()
+          counters = re.findall(r'<counter type="LINE" missed="(\d+)" covered="(\d+)"/>', xml)
+          print("LINE counters found:", len(counters))
+          missed, covered = map(int, counters[-1])
+          print(f"Kover LINE coverage: {covered}/{covered + missed} = {100 * covered / (covered + missed):.1f}%")
+          PY
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

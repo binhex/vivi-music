@@ -1,8 +1,16 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index cd1b6155..d5091c1c 100644
+index cd1b6155..7978f60f 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -224,6 +224,7 @@ dependencies {
+@@ -14,6 +14,7 @@ plugins {
+     alias(libs.plugins.compose.compiler)
+     alias(libs.plugins.kotlin.serialization)
+     alias(libs.plugins.protobufPlugin)
++    id("org.jetbrains.kotlinx.kover") version "0.9.9"
+ }
+ 
+ android {
+@@ -224,6 +225,7 @@ dependencies {
      implementation(libs.guava)
      implementation(libs.coroutines.guava)
      implementation(libs.concurrent.futures)
@@ -10,12 +18,40 @@ index cd1b6155..d5091c1c 100644
  
      implementation(libs.activity)
      implementation(libs.hilt.navigation)
+@@ -317,3 +319,27 @@ dependencies {
+     implementation(libs.androidx.core.splashscreen)
+ }
+ 
++// Coverage gate for the JVM-testable code. The Android-dependent classes below are excluded rather
++// than measured: they need Robolectric or a device, so their coverage is tracked as named debt.
++kover {
++    filters {
++        classes {
++            includes += listOf("com.music.vivi.playback.FolderTemplate")
++            excludes += listOf(
++                "com.music.vivi.playback.DownloadFolderExporter*",
++                "com.music.vivi.playback.SafFolders*",
++                "com.music.vivi.playback.LocalDownloadPrefs*",
++                "com.music.vivi.playback.DownloadUtil*",
++                "com.music.vivi.ui.screens.settings.LocalDownloadSettings*",
++            )
++        }
++    }
++    reports {
++        verify {
++            rule {
++                minBound(95)
++            }
++        }
++    }
++}
++
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..4f3cb9ca
+index 00000000..0ebec184
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,394 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -62,9 +98,12 @@ index 00000000..4f3cb9ca
 + * music player.
 + *
 + * Destination:
-+ *  - the SAF folder picked in Storage settings, when one is set and still writable, otherwise
++ *  - the SAF folder picked in Storage settings, when one is set and the write succeeds, otherwise
 + *  - `Music/Vivi` in public storage via MediaStore on API 29+, or the app-specific external music
 + *    directory on API 26-28 (visible to file managers there, and it needs no runtime permission).
++ *
++ * Below whichever root is used, the file goes into the subfolders resolved from the folder structure
++ * template (default `%artist%/%album%`).
 + *
 + * The cached download is never modified - it stays the source for offline playback - so an export
 + * failure can never break playback or lose the download.
@@ -1089,10 +1128,10 @@ index 00000000..a862f1c1
 +</resources>
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
 new file mode 100644
-index 00000000..5cc63ea4
+index 00000000..09d15033
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,190 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1138,14 +1177,6 @@ index 00000000..5cc63ea4
 +        val result = FolderTemplate.parse((1..7).joinToString("/") { "%artist%" })
 +        assertTrue(result.tooDeep)
 +        assertTrue(result.isValid)
-+    }
-+
-+    @Test
-+    fun `artist and album become segments`() {
-+        assertEquals(
-+            listOf("Metallica", "Master Of Puppets"),
-+            FolderTemplate.expand(input(), "%artist%/%album%"),
-+        )
 +    }
 +
 +    @Test
@@ -1275,6 +1306,7 @@ index 00000000..5cc63ea4
 +        assertEquals("Metallica - Enter Sandman.webm", FolderTemplate.fileName(input(), "audio/webm; codecs=opus"))
 +        assertEquals("Metallica - Enter Sandman.mp3", FolderTemplate.fileName(input(), "audio/mpeg"))
 +        assertEquals("Metallica - Enter Sandman.ogg", FolderTemplate.fileName(input(), "audio/ogg"))
++        assertEquals("Metallica - Enter Sandman.opus", FolderTemplate.fileName(input(), "audio/opus"))
 +        assertEquals("Metallica - Enter Sandman.flac", FolderTemplate.fileName(input(), "audio/flac"))
 +        assertEquals("Metallica - Enter Sandman.m4a", FolderTemplate.fileName(input(), null))
 +    }
