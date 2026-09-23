@@ -1,9 +1,9 @@
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..fa9c04fa
+index 00000000..c2dbc095
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,403 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -11,8 +11,8 @@ index 00000000..fa9c04fa
 +
 +package com.music.vivi.playback
 +
-+import android.content.ContentUris
 +import android.content.ContentResolver
++import android.content.ContentUris
 +import android.content.ContentValues
 +import android.content.Context
 +import android.net.Uri
@@ -94,14 +94,10 @@ index 00000000..fa9c04fa
 +            return
 +        }
 +
-+        val mimeType = song.format?.mimeType
-+            .orEmpty()
-+            .substringBefore(';')
-+            .trim()
-+            .ifEmpty { DEFAULT_MIME_TYPE }
-+        val fileName = buildFileName(song, mimeType)
-+
 +        try {
++            val mimeType = sniffMimeType(songId)
++                ?: song.format?.mimeType.orEmpty().substringBefore(';').trim().ifEmpty { DEFAULT_MIME_TYPE }
++            val fileName = buildFileName(song, mimeType)
 +            write(songId, fileName, mimeType)
 +            Timber.tag(TAG).i("Exported %s as %s", songId, fileName)
 +        } catch (e: CancellationException) {
@@ -128,14 +124,20 @@ index 00000000..fa9c04fa
 +        writeToPublicMusic(songId, fileName, mimeType)
 +    }
 +
++    /**
++     * Writes beside the target name and only swaps it in once the copy succeeded, so an interrupted
++     * export cannot truncate the previous file.
++     */
 +    private fun writeToDocumentTree(
 +        treeUri: Uri,
 +        songId: String,
 +        fileName: String,
 +        mimeType: String,
 +    ) {
-+        val uri = SafFolders.createOrReplaceFile(context, treeUri, mimeType, fileName)
-+            ?: throw IOException("Could not create $fileName in $treeUri")
++        val existing = SafFolders.findFile(context, treeUri, fileName)
++        val target = if (existing == null) fileName else "$fileName$PART_SUFFIX"
++        val uri = SafFolders.createFile(context, treeUri, mimeType, target)
++            ?: throw IOException("Could not create $target in $treeUri")
 +        try {
 +            val output = context.contentResolver.openOutputStream(uri, OPEN_MODE_TRUNCATE)
 +                ?: throw IOException("Could not open output stream for $uri")
@@ -143,6 +145,12 @@ index 00000000..fa9c04fa
 +        } catch (e: Exception) {
 +            SafFolders.delete(context, uri)
 +            throw e
++        }
++        if (existing != null) {
++            SafFolders.delete(context, existing)
++            if (SafFolders.rename(context, uri, fileName) == null) {
++                Timber.tag(TAG).w("Could not rename %s to %s", target, fileName)
++            }
 +        }
 +    }
 +
@@ -241,11 +249,20 @@ index 00000000..fa9c04fa
 +        if (!directory.exists() && !directory.mkdirs()) {
 +            Timber.tag(TAG).w("Could not create %s", directory)
 +        }
-+        val file = File(directory, fileName)
++        // Stage the copy for the same reason as the SAF path: an interrupted export must not
++        // truncate the previous file.
++        val staging = File(directory, "$fileName$PART_SUFFIX")
 +        try {
-+            file.outputStream().use { copyFromCache(songId, it) }
++            staging.outputStream().use { copyFromCache(songId, it) }
++            val target = File(directory, fileName)
++            if (target.exists() && !target.delete()) {
++                Timber.tag(TAG).w("Could not replace %s", target)
++            }
++            if (!staging.renameTo(target)) {
++                Timber.tag(TAG).w("Could not rename %s to %s", staging, target)
++            }
 +        } catch (e: Exception) {
-+            runCatching { file.delete() }
++            runCatching { staging.delete() }
 +            throw e
 +        }
 +    }
@@ -283,6 +300,59 @@ index 00000000..fa9c04fa
 +        } finally {
 +            runCatching { dataSource.close() }
 +        }
++    }
++
++    /**
++     * Names the file after the container that was actually downloaded.
++     *
++     * The stored format row is rewritten by every stream resolution and the audio quality setting
++     * selects different containers, so it can disagree with the cached bytes; the extension decides
++     * whether a player will even try to open the file. Null falls back to the stored mime type.
++     */
++    private fun sniffMimeType(songId: String): String? {
++        val available = downloadCache.getCachedBytes(songId, 0, Long.MAX_VALUE)
++        if (available <= 0L) return null
++        val sniffLength = minOf(available, MAGIC_SIZE.toLong()).toInt()
++
++        val dataSource = CacheDataSource(downloadCache, null)
++        return try {
++            dataSource.open(
++                DataSpec.Builder()
++                    .setUri(songId.toUri())
++                    .setKey(songId)
++                    .setLength(sniffLength.toLong())
++                    .build(),
++            )
++            val magic = ByteArray(sniffLength)
++            var read = 0
++            while (read < sniffLength) {
++                val count = dataSource.read(magic, read, sniffLength - read)
++                if (count <= 0) break
++                read += count
++            }
++            mimeTypeOf(magic, read)
++        } catch (e: Exception) {
++            null
++        } finally {
++            runCatching { dataSource.close() }
++        }
++    }
++
++    private fun mimeTypeOf(magic: ByteArray, length: Int): String? = when {
++        // EBML header, i.e. WebM/Matroska - what YouTube Opus streams are wrapped in.
++        length >= 4 && magic[0] == EBML[0] && magic[1] == EBML[1] &&
++            magic[2] == EBML[2] && magic[3] == EBML[3] -> "audio/webm"
++        length >= 8 && asciiEquals(magic, 4, "ftyp") -> "audio/mp4"
++        length >= 4 && asciiEquals(magic, 0, "fLaC") -> "audio/flac"
++        length >= 4 && asciiEquals(magic, 0, "OggS") -> "audio/ogg"
++        length >= 3 && asciiEquals(magic, 0, "ID3") -> "audio/mpeg"
++        length >= 2 && magic[0] == 0xFF.toByte() && magic[1].toInt() and 0xE0 == 0xE0 -> "audio/mpeg"
++        else -> null
++    }
++
++    private fun asciiEquals(bytes: ByteArray, offset: Int, expected: String): Boolean {
++        if (bytes.size < offset + expected.length) return false
++        return expected.indices.all { bytes[offset + it] == expected[it].code.toByte() }
 +    }
 +
 +    private fun buildFileName(song: Song, mimeType: String): String {
@@ -328,8 +398,11 @@ index 00000000..fa9c04fa
 +        const val DEFAULT_MIME_TYPE = "audio/mp4"
 +        const val UNKNOWN_ARTIST = "Unknown Artist"
 +        const val OPEN_MODE_TRUNCATE = "wt"
++        const val PART_SUFFIX = ".part"
 +        const val BUFFER_SIZE = 64 * 1024
 +        const val MAX_NAME_BYTES = 200
++        const val MAGIC_SIZE = 12
++        val EBML = byteArrayOf(0x1A, 0x45, 0xDF.toByte(), 0xA3.toByte())
 +        val INVALID_FILE_CHARS = Regex("[\\\\/:*?\"<>|]")
 +        val WHITESPACE = Regex("\\s+")
 +    }
@@ -383,10 +456,10 @@ index 00000000..40c13961
 +val DownloadFolderUriKey = stringPreferencesKey("downloadFolderUri")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 new file mode 100644
-index 00000000..d0a3aa70
+index 00000000..7f96b589
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,98 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -413,32 +486,37 @@ index 00000000..d0a3aa70
 +internal object SafFolders {
 +
 +    /** Display name of the picked folder, or null when the grant is gone or the folder is unreadable. */
-+    fun displayName(context: Context, treeUri: Uri): String? =
++    fun displayName(context: Context, treeUri: Uri): String? = runCatching {
 +        query(context, documentUri(treeUri), arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) {
 +            it.getString(0)
 +        }
++    }.getOrNull()
 +
-+    /**
-+     * Returns a writable document URI for [displayName] inside the tree, replacing an existing file
-+     * of that name when the provider allows deleting it. Null means the folder refused the write.
-+     *
-+     * When the delete is refused the existing document is returned instead: callers open it in
-+     * truncating mode, so a re-download still overwrites rather than appending.
-+     */
-+    fun createOrReplaceFile(
-+        context: Context,
-+        treeUri: Uri,
-+        mimeType: String,
-+        displayName: String,
-+    ): Uri? {
-+        val existing = findFile(context, treeUri, displayName)
-+        if (existing != null) {
-+            val deleted = runCatching {
-+                DocumentsContract.deleteDocument(context.contentResolver, existing)
-+            }.getOrDefault(false)
-+            if (!deleted) return existing
++    /** URI of the file called [displayName] directly inside the tree, or null when there is none. */
++    fun findFile(context: Context, treeUri: Uri, displayName: String): Uri? = runCatching {
++        query(
++            context,
++            childrenUri(treeUri),
++            arrayOf(
++                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
++                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
++            ),
++        ) { cursor ->
++            var match: Uri? = null
++            // query() has already positioned the cursor on the first row, so start there.
++            do {
++                if (cursor.getString(1) == displayName) {
++                    match = DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(0))
++                    break
++                }
++            } while (cursor.moveToNext())
++            match
 +        }
-+        return runCatching {
++    }.getOrNull()
++
++    /** Creates a file called [displayName] directly inside the tree, or null when the folder refuses. */
++    fun createFile(context: Context, treeUri: Uri, mimeType: String, displayName: String): Uri? =
++        runCatching {
 +            DocumentsContract.createDocument(
 +                context.contentResolver,
 +                documentUri(treeUri),
@@ -446,34 +524,22 @@ index 00000000..d0a3aa70
 +                displayName,
 +            )
 +        }.getOrNull()
-+    }
++
++    /** Best-effort rename; null means the provider does not support renaming. */
++    fun rename(context: Context, documentUri: Uri, displayName: String): Uri? = runCatching {
++        DocumentsContract.renameDocument(context.contentResolver, documentUri, displayName)
++    }.getOrNull()
 +
 +    /** Best-effort delete, used to clean up a half-written export. */
 +    fun delete(context: Context, documentUri: Uri) {
 +        runCatching { DocumentsContract.deleteDocument(context.contentResolver, documentUri) }
 +    }
 +
-+    private fun findFile(context: Context, treeUri: Uri, displayName: String): Uri? =
-+        query(
-+            context,
-+            DocumentsContract.buildChildDocumentsUriUsingTree(
-+                treeUri,
-+                DocumentsContract.getTreeDocumentId(treeUri),
-+            ),
-+            arrayOf(
-+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-+            ),
-+        ) { cursor ->
-+            var match: Uri? = null
-+            while (cursor.moveToNext()) {
-+                if (cursor.getString(1) == displayName) {
-+                    match = DocumentsContract.buildDocumentUriUsingTree(treeUri, cursor.getString(0))
-+                    break
-+                }
-+            }
-+            match
-+        }
++    private fun childrenUri(treeUri: Uri): Uri =
++        DocumentsContract.buildChildDocumentsUriUsingTree(
++            treeUri,
++            DocumentsContract.getTreeDocumentId(treeUri),
++        )
 +
 +    private fun documentUri(treeUri: Uri): Uri =
 +        DocumentsContract.buildDocumentUriUsingTree(
@@ -494,10 +560,10 @@ index 00000000..d0a3aa70
 +}
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..98c2b585
+index 00000000..2aa6b165
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,153 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -529,6 +595,7 @@ index 00000000..98c2b585
 +import com.music.vivi.ui.component.Material3SettingsItem
 +import com.music.vivi.utils.rememberPreference
 +import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.isActive
 +import kotlinx.coroutines.withContext
 +import timber.log.Timber
 +
@@ -546,14 +613,21 @@ index 00000000..98c2b585
 +    val (folderUri, onFolderUriChange) = rememberPreference(DownloadFolderUriKey, "")
 +
 +    var folderName by remember(folderUri) { mutableStateOf<String?>(null) }
++    var resolving by remember(folderUri) { mutableStateOf(false) }
 +
 +    // Resolving the display name touches the documents provider, so keep it off the main thread. A
 +    // null result is how a revoked grant shows up: the provider throws, and SafFolders reports null.
 +    LaunchedEffect(folderUri) {
 +        folderName = null
++        resolving = folderUri.isNotBlank()
 +        if (folderUri.isNotBlank()) {
-+            withContext(Dispatchers.IO) {
-+                folderName = SafFolders.displayName(context, folderUri.toUri())
++            val resolved = withContext(Dispatchers.IO) {
++                SafFolders.displayName(context, folderUri.toUri())
++            }
++            // A newer folder may already have been picked while this lookup was running.
++            if (isActive) {
++                folderName = resolved
++                resolving = false
 +            }
 +        }
 +    }
@@ -561,16 +635,20 @@ index 00000000..98c2b585
 +    val pickFolder =
 +        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
 +            if (uri != null) {
-+                runCatching {
++                val persisted = runCatching {
 +                    context.contentResolver.takePersistableUriPermission(
 +                        uri,
 +                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
 +                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
 +                    )
-+                }.onFailure { Timber.tag(TAG).w(it, "Could not persist folder permission") }
-+                // Switching folders must not leak the previous persisted grant.
-+                releasePersistedPermission(context, folderUri)
-+                onFolderUriChange(uri.toString())
++                }.onFailure { Timber.tag(TAG).w(it, "Could not persist folder permission") }.isSuccess
++
++                if (persisted) {
++                    // Switching folders must not leak the previous grant, but re-picking the folder
++                    // that is already configured must not release the grant we just took either.
++                    if (uri.toString() != folderUri) releasePersistedPermission(context, folderUri)
++                    onFolderUriChange(uri.toString())
++                }
 +            }
 +        }
 +
@@ -588,6 +666,7 @@ index 00000000..98c2b585
 +                                !exportEnabled -> stringResource(R.string.download_folder_off)
 +                                folderUri.isBlank() ->
 +                                    stringResource(R.string.download_folder_default)
++                                resolving -> stringResource(R.string.download_folder_checking)
 +                                name != null -> stringResource(R.string.download_folder_current, name)
 +                                else -> stringResource(R.string.download_folder_permission_lost)
 +                            },
@@ -653,10 +732,10 @@ index aa40ee3e..19d47e14 100644
              items = listOf(
 diff --git a/app/src/main/res/values/local_download_strings.xml b/app/src/main/res/values/local_download_strings.xml
 new file mode 100644
-index 00000000..cd5f0a53
+index 00000000..a52033fa
 --- /dev/null
 +++ b/app/src/main/res/values/local_download_strings.xml
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!--
 +  Strings for the "save downloads to a folder" patch.
@@ -670,6 +749,7 @@ index 00000000..cd5f0a53
 +    <string name="download_folder_current">Folder: %1$s</string>
 +    <string name="download_folder_pick">Choose folder</string>
 +    <string name="download_folder_reset">Use the default folder</string>
++    <string name="download_folder_checking">Checking folder access...</string>
 +    <string name="download_folder_off">Disabled, downloads stay hidden in the app cache</string>
 +    <string name="download_folder_permission_lost">Folder access lost, using Music/Vivi. Choose the folder again.</string>
 +</resources>

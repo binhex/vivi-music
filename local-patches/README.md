@@ -48,7 +48,10 @@ Footprint: 5 new files, plus **4 added lines** in two upstream files -
 | --- | --- |
 | Only downloads that finish *after* the feature is on get exported | There is no sweep for the existing library and no retry for a failed export. A one-shot "export existing downloads" action is the natural follow-up. |
 | Same artist + title means one file | Two different songs that share artist and title (likely when the artist is unknown, e.g. `Unknown Artist - Intro.m4a`) map to the same name and the later export replaces the earlier one. Fix would be a song-id suffix in `buildFileName`. |
-| A failed re-export removes the previous exported file | The old file is deleted before the new copy is written. The download itself is never touched, so the audio is not lost - only the visible file until the next successful export. MediaStore keeps partial files out of the media database via `IS_PENDING`. |
+| The SAF folder is treated as Vivi's own export folder | SAF has no ownership column (unlike MediaStore's `OWNER_PACKAGE_NAME`), so an existing file with the same name is replaced. Point the feature at a dedicated folder if it already holds files from other tools. |
+| A foreign file with the exact same name makes MediaStore rename ours | Our copy becomes `Name (1).m4a`, and later re-exports add `(2)`, `(3)`... because cleanup matches the exact display name. |
+| Replacing an export is staged, not atomic across a crash | The new file is written as `Name.m4a.part` and renamed into place, so an interrupted copy leaves a `.part` file rather than truncating the previous export. The MediaStore path is protected by `IS_PENDING` instead. |
+| The extension follows the downloaded bytes | Extension and MIME are sniffed from the cached container (WebM/MP4/MP3/FLAC/OGG) and only fall back to the stored format row: the audio quality setting can pick a different container after the download, so the row alone would mislabel the file. |
 | Deleting a download in the app leaves the exported file | Intentional: the exported file lives in the user's own Music folder, and the app does not delete user files. |
 | API 26-28 exports are not in the media database | They land in `Android/data/<pkg>/files/Music/Vivi`, which the media scanner does not index, so only file managers see them. |
 | Files go directly in the picked folder | No `Vivi` subfolder is created inside a SAF folder the user chose. |
@@ -95,9 +98,10 @@ cd /tmp/vivi-check && /path/to/this/repo/local-patches/apply.sh --check
 - GitHub disables scheduled workflows after 60 days without repository activity. If the weekly drift
   check stops running, re-enable it from the Actions tab.
 - On-device checklist for patch 01: pick a folder and confirm the setting immediately reads
-  `Folder: <name>` (not "Folder access lost"); download a song and confirm it lands in that folder;
-  re-download it (must overwrite, not duplicate); reset the folder (or revoke its access) and confirm
-  the fallback to `Music/Vivi`; switch the feature off and confirm nothing is written; play a
-  downloaded song in airplane mode to confirm offline playback is untouched.
+  `Folder: <name>` (not "Folder access lost"); pick the **same** folder again and confirm the grant
+  survives; download a song and confirm it lands in that folder and plays; re-download it (must
+  replace, not duplicate); reset the folder (or revoke its access) and confirm the fallback to
+  `Music/Vivi`; switch the feature off and confirm nothing is written; play a downloaded song in
+  airplane mode to confirm offline playback is untouched.
 - Debugging: `adb logcat -s DownloadFolderExporter LocalDownloadSettings` reports every export result
   (`Exported <id> as <name>`, or `Export failed ... cached download is intact`).
