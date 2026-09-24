@@ -135,19 +135,25 @@ jobs:
         run: |
           set -euo pipefail
           ./gradlew --console=plain --no-configuration-cache koverXmlReport koverVerify
-          report="$(find . -path '*reports/kover/*.xml' | head -1)"
-          echo "kover xml report: ${report:-none}"
-          if [[ -n "${report}" ]]; then
-            python3 - "${report}" <<'PY'
-            import re, sys
-            path = sys.argv[1]
-            xml = open(path).read()
-            counters = re.findall(r'<counter type="LINE" missed="(\d+)" covered="(\d+)"/>', xml)
-            print("LINE counters found:", len(counters))
-            missed, covered = map(int, counters[-1])
-            print(f"Kover LINE coverage: {covered}/{covered + missed} = {100 * covered / (covered + missed):.1f}%")
-            PY
+          report="$(find . -path '*reports/kover/report.xml' | head -1)"
+          if [[ -z "${report}" ]]; then
+            report="$(find . -path '*reports/kover/*.xml' | head -1)"
           fi
+          echo "kover xml report: ${report:-none}"
+          python3 - "${report}" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          if not path:
+              print("no kover XML report found; the gradle koverVerify task is the gate")
+              raise SystemExit(0)
+          xml = open(path).read()
+          counters = re.findall(r'<counter type="LINE" missed="(\d+)" covered="(\d+)"/>', xml)
+          if not counters:
+              print(f"no LINE counters in {path}")
+              raise SystemExit(0)
+          missed, covered = map(int, counters[-1])
+          print(f"Kover LINE coverage: {covered}/{covered + missed} = {100 * covered / (covered + missed):.1f}%")
+          PY
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

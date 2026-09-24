@@ -42,10 +42,10 @@ index cd1b6155..4d8685d1 100644
 +
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..5e57f1de
+index 00000000..f27d18fb
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,404 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -139,16 +139,18 @@ index 00000000..5e57f1de
 +            return
 +        }
 +
-+        val template = FolderTemplate.templateOrDefault(context.dataStore[DownloadFolderTemplateKey])
-+        if (FolderTemplate.parse(template).tooDeep) {
-+            Timber.tag(TAG).w(
-+                "Template uses more than %d folders, the extra ones are ignored",
-+                FolderTemplate.MAX_SEGMENTS,
-+            )
-+        }
++        val input = song.toTemplateInput()
 +
 +        try {
-+            val input = song.toTemplateInput()
++            // Inside the try: export() is fired and forgotten from DownloadUtil's own scope, so a
++            // preference read failure must not escape as an uncaught exception.
++            val template = FolderTemplate.templateOrDefault(context.dataStore[DownloadFolderTemplateKey])
++            if (FolderTemplate.parse(template).tooDeep) {
++                Timber.tag(TAG).w(
++                    "Template uses more than %d folders, the extra ones are ignored",
++                    FolderTemplate.MAX_SEGMENTS,
++                )
++            }
 +            val mimeType = sniffMimeType(songId)
 +                ?: song.format?.mimeType.orEmpty().substringBefore(';').trim()
 +                    .ifEmpty { FolderTemplate.DEFAULT_MIME_TYPE }
@@ -470,10 +472,10 @@ index df48f9bb..d3725f5b 100644
                                  Download.STATE_STOPPED,
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
 new file mode 100644
-index 00000000..0a38f875
+index 00000000..b72899e4
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,177 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -537,7 +539,7 @@ index 00000000..0a38f875
 +        val bitrate: Int?,
 +    )
 +
-+    /** Validation outcome for the settings editor. */
++    /** Validation outcome for the settings editor. [unknownTokens] keeps the spelling the user typed. */
 +    data class ParseResult(
 +        val unknownTokens: List<String>,
 +        val tooDeep: Boolean,
@@ -555,8 +557,8 @@ index 00000000..0a38f875
 +    fun parse(template: String): ParseResult {
 +        val segments = normalise(template)
 +        val unknown = segments
-+            .flatMap { segment -> TOKEN_PATTERN.findAll(segment).map { it.groupValues[1].lowercase() } }
-+            .filterNot { it in SUPPORTED }
++            .flatMap { segment -> TOKEN_PATTERN.findAll(segment).map { it.value } }
++            .filterNot { it.drop(1).dropLast(1).lowercase() in SUPPORTED }
 +            .distinct()
 +        // Count the segments this template will really contribute. Tokens are unresolved here, so a token
 +        // that resolves to nothing at export time can still make this count one too high.
@@ -574,9 +576,10 @@ index 00000000..0a38f875
 +    /** Sanitised `Artist - Title`, without an extension. */
 +    fun fileNameBase(input: Input): String {
 +        // Each part is sanitised on its own first: a title that sanitises away (dots only) must fall back
-+        // to the song id rather than leaving a dangling separator behind.
++        // to the song id rather than leaving a dangling separator behind, and an imported id can contain
++        // characters that are illegal in a file name.
 +        val artist = sanitizeSegment(input.artists.joinToString(", ")).ifBlank { UNKNOWN_ARTIST }
-+        val title = sanitizeSegment(input.title.orEmpty()).ifBlank { input.songId }
++        val title = sanitizeSegment(input.title.orEmpty()).ifBlank { sanitizeSegment(input.songId) }
 +        val base = truncateToBytes(
 +            "$artist - $title",
 +            MAX_FILE_NAME_BYTES - MAX_EXTENSION_BYTES,
@@ -821,10 +824,10 @@ index 00000000..4520a2af
 +private const val TAG = "SafFolders"
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..06d40d87
+index 00000000..caacff7c
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,307 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -939,8 +942,10 @@ index 00000000..06d40d87
 +                    // Switching folders must not leak the previous grant, but re-picking the folder
 +                    // that is already configured must not release the grant we just took either.
 +                    if (uri.toString() != folderUri) releasePersistedPermission(context, folderUri)
-+                    onFolderUriChange(uri.toString())
 +                }
++                // Stored either way: the grant may still be alive for this session, and the exporter
++                // falls back to Music/Vivi (and the description says so) when it is not.
++                onFolderUriChange(uri.toString())
 +            }
 +        }
 +
@@ -1051,8 +1056,10 @@ index 00000000..06d40d87
 +        songId = "dQw4w9WgXcQ",
 +        title = "Enter Sandman",
 +        artists = listOf("Metallica"),
-+        album = "Master Of Puppets",
-+        year = 1986,
++        albumTitle = "Master Of Puppets",
++        storedAlbumName = null,
++        songYear = 1986,
++        albumYear = null,
 +        bitrate = 256_000,
 +    )
 +    val previewInput = sampleSong?.toTemplateInput() ?: example
@@ -1080,7 +1087,7 @@ index 00000000..06d40d87
 +            Text(
 +                text = stringResource(
 +                    R.string.download_folder_structure_unknown_token,
-+                    result.unknownTokens.joinToString(", ") { "%$it%" },
++                    result.unknownTokens.joinToString(", "),
 +                ),
 +                color = MaterialTheme.colorScheme.error,
 +                style = MaterialTheme.typography.bodySmall,
@@ -1173,10 +1180,10 @@ index 00000000..a862f1c1
 +</resources>
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
 new file mode 100644
-index 00000000..dc07789b
+index 00000000..9d70dd14
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,293 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1212,9 +1219,9 @@ index 00000000..dc07789b
 +    )
 +
 +    @Test
-+    fun `parse reports unknown tokens`() {
-+        val result = FolderTemplate.parse("%artist%/%genre%/%bogus%")
-+        assertEquals(listOf("genre", "bogus"), result.unknownTokens)
++    fun `parse reports unknown tokens in the spelling the user typed`() {
++        val result = FolderTemplate.parse("%artist%/%genre%/%BOGUS%")
++        assertEquals(listOf("%genre%", "%BOGUS%"), result.unknownTokens)
 +        assertFalse(result.isValid)
 +    }
 +
@@ -1452,6 +1459,14 @@ index 00000000..dc07789b
 +        assertEquals(
 +            "Unknown Artist - dQw4w9WgXcQ.m4a",
 +            FolderTemplate.fileName(input(title = "..", artists = emptyList()), "audio/mp4"),
++        )
++    }
++
++    @Test
++    fun `file name sanitises an id used as the title fallback`() {
++        assertEquals(
++            "Unknown Artist - a_b.m4a",
++            FolderTemplate.fileName(input(title = "..", artists = emptyList(), songId = "a/b"), "audio/mp4"),
 +        )
 +    }
 +
