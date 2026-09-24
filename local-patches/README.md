@@ -43,7 +43,7 @@ in a file manager or any other music player:
 - The private Media3 download cache is never modified, so an export failure cannot break offline
   playback: the copy is read from the cache and only the new file is touched.
 
-Footprint: 7 new files, plus **5 added lines** in three upstream files -
+Footprint: 7 new files, plus **30 added lines** in three upstream files -
 `DownloadUtil.kt` (constructor parameter + one call in the `STATE_COMPLETED` branch),
 `StorageSettings.kt` (one call to `LocalDownloadSettingsGroup()`) and
 `app/build.gradle.kts` (`testImplementation(libs.junit)` for the new unit tests).
@@ -69,8 +69,9 @@ Footprint: 7 new files, plus **5 added lines** in three upstream files -
 is explicit in `app/build.gradle.kts`:
 
 - **Measured:** `FolderTemplate` (the pure path and naming rules) - 64/65 lines = **98.5%**.
-- **Excluded, because they need Robolectric or a device:** `DownloadFolderExporter`, `SafFolders`,
-  `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`.
+- **Excluded from the measured scope, because they need Robolectric or a device:** `DownloadFolderExporter`,
+  `SafFolders`, `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`. The gate's `includes` filter
+  limits measurement to `FolderTemplate`, so these are named debt here rather than listed in the build file.
 - **Not measured at all (named debt):** the `canvas`, `innertube` and `lyricsProvider` modules. Wiring
   Kover into them means build-file contact in modules this patch never touches, and a 95% bound there
   would likely fail on pre-existing coverage. Agreed with the maintainer to record it as debt.
