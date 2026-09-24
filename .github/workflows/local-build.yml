@@ -127,23 +127,15 @@ jobs:
             "test${{ steps.inputs.outputs.variant }}UnitTest"
 
       # Coverage gate for the JVM-testable code (Kover, min 95% line coverage on the filtered scope).
-      # Task names are discovered once and the variant-specific ones are used deliberately: the plain
-      # koverXmlReport name triggers the tests of every flavour and ABI variant.
+      # The variant-specific task names are used on purpose: the plain koverXmlReport/koverVerify names
+      # pull in the tests of every flavour and ABI variant (~40 minutes per run).
       - name: Verify coverage
         working-directory: src
         run: |
           set -euo pipefail
-          variant="${{ steps.inputs.outputs.variant }}"
-          tasks="$(./gradlew -q --console=plain tasks --all | grep -oE 'kover[A-Za-z]+' | sort -u)"
-          echo "kover tasks available:"; echo "${tasks}"
-          report_task="$(echo "${tasks}" | grep -x "koverXmlReport${variant}" | head -1)"
-          verify_task="$(echo "${tasks}" | grep -x "koverVerify${variant}" | head -1)"
-          if [[ -z "${report_task}" || -z "${verify_task}" ]]; then
-            echo "Expected koverXmlReport${variant} and koverVerify${variant} to exist" >&2
-            exit 1
-          fi
-          echo "running: ${report_task} ${verify_task}"
-          ./gradlew --console=plain --no-configuration-cache "${report_task}" "${verify_task}"
+          ./gradlew --console=plain --no-configuration-cache \
+            "koverXmlReport${{ steps.inputs.outputs.variant }}" \
+            "koverVerify${{ steps.inputs.outputs.variant }}"
           report="$(find . -path '*reports/kover/report.xml' | head -1)"
           echo "kover xml report: ${report:-none}"
           python3 - "${report}" <<'PY'
