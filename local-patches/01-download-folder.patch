@@ -47,10 +47,10 @@ index cd1b6155..81a9349b 100644
 +
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..9c4df90a
+index 00000000..1d042c5e
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,440 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -143,11 +143,11 @@ index 00000000..9c4df90a
 +            return
 +        }
 +
-+        val input = song.toTemplateInput()
-+
 +        try {
-+            // Everything below is inside the try, including the preference reads: export() is fired and
-+            // forgotten from DownloadUtil's own scope, so nothing here may escape as an uncaught exception.
++            // Everything below is inside the try, including the metadata mapping and the preference reads:
++            // export() is fired and forgotten from DownloadUtil's own scope, so nothing here may escape as
++            // an uncaught exception.
++            val input = song.toTemplateInput()
 +            if (context.dataStore[DownloadFolderExportEnabledKey] == false) return
 +            val template = FolderTemplate.templateOrDefault(context.dataStore[DownloadFolderTemplateKey])
 +            if (FolderTemplate.parse(template).tooDeep) {
@@ -200,8 +200,9 @@ index 00000000..9c4df90a
 +    ) {
 +        val directory = SafFolders.resolveDirectory(context, treeUri, segments)
 +        val found = SafFolders.findFile(context, treeUri, directory, fileName)
-+        // A folder that happens to carry the export's name must never be deleted recursively.
-+        val existing = if (found != null && SafFolders.isDirectory(context, found)) {
++        // A folder that happens to carry the export's name must never be deleted recursively, so an
++        // unanswerable MIME query is treated as "leave it alone" rather than "not a folder".
++        val existing = if (found != null && SafFolders.isDirectory(context, found) != false) {
 +            Timber.tag(TAG).w("%s is a folder, leaving it alone", fileName)
 +            null
 +        } else {
@@ -219,7 +220,9 @@ index 00000000..9c4df90a
 +            throw e
 +        }
 +        if (existing != null) {
-+            SafFolders.delete(context, existing)
++            if (!SafFolders.delete(context, existing)) {
++                Timber.tag(TAG).w("Could not replace the previous export of %s", fileName)
++            }
 +            if (SafFolders.rename(context, uri, fileName) == null) {
 +                Timber.tag(TAG).w("Could not rename %s to %s", target, fileName)
 +            }
@@ -315,23 +318,28 @@ index 00000000..9c4df90a
 +            }
 +            ids
 +        }.getOrElse { failure ->
-+            // No owner column on this API level: fall back to a name-and-path query. On Q+ the platform
-+            // itself refuses to delete rows this app does not own, so a foreign file is still safe.
-+            Timber.tag(TAG).w(failure, "Could not filter %s by owner, matching the name only", fileName)
-+            runCatching {
-+                val ids = mutableListOf<Long>()
-+                resolver.query(
-+                    collection,
-+                    arrayOf(MediaStore.Audio.Media._ID),
-+                    "${MediaStore.Audio.Media.DISPLAY_NAME} = ? AND " +
-+                        "${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
-+                    arrayOf(fileName, "$relativePath/"),
-+                    null,
-+                )?.use { cursor ->
-+                    while (cursor.moveToNext()) ids += cursor.getLong(0)
-+                }
-+                ids
-+            }.getOrElse { emptyList() }
++            // Only an unknown column justifies a name-only query. Any other failure leaves the previous
++            // export alone, because deleting by name could touch a row this app does not own.
++            if (failure !is IllegalArgumentException) {
++                Timber.tag(TAG).w(failure, "Could not inspect the previous export of %s", fileName)
++                emptyList()
++            } else {
++                Timber.tag(TAG).w(failure, "No owner column for %s, matching the name only", fileName)
++                runCatching {
++                    val ids = mutableListOf<Long>()
++                    resolver.query(
++                        collection,
++                        arrayOf(MediaStore.Audio.Media._ID),
++                        "${MediaStore.Audio.Media.DISPLAY_NAME} = ? AND " +
++                            "${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
++                        arrayOf(fileName, "$relativePath/"),
++                        null,
++                    )?.use { cursor ->
++                        while (cursor.moveToNext()) ids += cursor.getLong(0)
++                    }
++                    ids
++                }.getOrElse { emptyList() }
++            }
 +        }
 +
 +        ownedIds.forEach { id ->
@@ -505,10 +513,10 @@ index df48f9bb..d3725f5b 100644
                                  Download.STATE_STOPPED,
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
 new file mode 100644
-index 00000000..36583849
+index 00000000..947dfebf
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,194 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -547,6 +555,9 @@ index 00000000..36583849
 +
 +    private val SUPPORTED = setOf("artist", "album", "year", "title", "songid", "quality")
 +    private val TOKEN_PATTERN = Regex("%([A-Za-z]+)%")
++
++    /** An unclosed token attempt (`%genre`, `%%`); a bare percent as in `100% Hits` is not matched. */
++    private val UNCLOSED_TOKEN = Regex("%[A-Za-z%]")
 +    private val INVALID_CHARS = Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\u007F]")
 +    private val WHITESPACE = Regex("\\s+")
 +
@@ -594,10 +605,12 @@ index 00000000..36583849
 +            .flatMap { segment ->
 +                val found = TOKEN_PATTERN.findAll(segment).map { it.value }.toList()
 +                val unrecognised = found.filterNot { it.drop(1).dropLast(1).lowercase() in SUPPORTED }
-+                // A token that the pattern could not consume at all, such as "%genre" or "%%artist%%",
-+                // would otherwise be exported as literal text with no warning in the editor.
++                // A token the pattern could not consume at all, such as "%genre", would otherwise be
++                // exported as literal text with no warning. A plain percent, as in "100% Hits", is a
++                // legal name and must not be reported.
 +                val partial = TOKEN_PATTERN.replace(segment, "").trim()
-+                unrecognised + if (partial.contains('%')) listOf(partial) else emptyList()
++                val unclosed = partial.takeIf { UNCLOSED_TOKEN.containsMatchIn(it) }
++                unrecognised + listOfNotNull(unclosed)
 +            }
 +            .distinct()
 +        // Count the segments this template will really contribute. Tokens are unresolved here, so a token
@@ -730,10 +743,10 @@ index 00000000..c918728c
 +val DownloadFolderTemplateKey = stringPreferencesKey("downloadFolderTemplate")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 new file mode 100644
-index 00000000..9a5cdc00
+index 00000000..a33e48bb
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,134 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -780,7 +793,7 @@ index 00000000..9a5cdc00
 +            val existing = findFile(context, treeUri, parent, segment)
 +            val next = when {
 +                existing == null -> createDirectory(context, parent, segment)
-+                isDirectory(context, existing) -> existing
++                isDirectory(context, existing) == true -> existing
 +                else -> null
 +            }
 +            if (next == null) {
@@ -833,20 +846,21 @@ index 00000000..9a5cdc00
 +            )
 +        }.getOrNull()
 +
-+    fun isDirectory(context: Context, uri: Uri): Boolean =
++    /** True when the document is a folder; null when the provider could not be asked. */
++    fun isDirectory(context: Context, uri: Uri): Boolean? =
 +        query(context, uri, arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE)) { cursor ->
 +            cursor.getString(0) == DocumentsContract.Document.MIME_TYPE_DIR
-+        } ?: false
++        }
 +
 +    /** Best-effort rename; null means the provider does not support renaming. */
 +    fun rename(context: Context, documentUri: Uri, displayName: String): Uri? = runCatching {
 +        DocumentsContract.renameDocument(context.contentResolver, documentUri, displayName)
 +    }.getOrNull()
 +
-+    /** Best-effort delete, used to clean up a half-written export. */
-+    fun delete(context: Context, documentUri: Uri) {
++    /** Best-effort delete, used to clean up a half-written export. False when the provider refused. */
++    fun delete(context: Context, documentUri: Uri): Boolean =
 +        runCatching { DocumentsContract.deleteDocument(context.contentResolver, documentUri) }
-+    }
++            .getOrDefault(false)
 +
 +    private fun documentUri(treeUri: Uri): Uri =
 +        DocumentsContract.buildDocumentUriUsingTree(
@@ -1225,10 +1239,10 @@ index 00000000..a862f1c1
 +</resources>
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
 new file mode 100644
-index 00000000..2ab40789
+index 00000000..c8971878
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,329 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1298,6 +1312,12 @@ index 00000000..2ab40789
 +    fun `parse flags a token the pattern cannot consume`() {
 +        assertEquals(listOf("%genre"), FolderTemplate.parse("%artist%/%genre").unknownTokens)
 +        assertEquals(listOf("%%"), FolderTemplate.parse("%%artist%%").unknownTokens)
++    }
++
++    @Test
++    fun `parse accepts a literal percent in a name`() {
++        assertTrue(FolderTemplate.parse("%artist%/%album% - 100% Hits").isValid)
++        assertTrue(FolderTemplate.parse("100% Hits/%artist%").isValid)
 +    }
 +
 +    @Test
