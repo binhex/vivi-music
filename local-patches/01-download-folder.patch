@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index cd1b6155..4d8685d1 100644
+index cd1b6155..b0de884a 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -14,6 +14,7 @@ plugins {
@@ -29,7 +29,7 @@ index cd1b6155..4d8685d1 100644
 +    reports {
 +        filters {
 +            includes {
-+                classes("com.music.vivi.playback.FolderTemplate")
++                classes("com.music.vivi.playback.FolderTemplate*")
 +            }
 +        }
 +        verify {
@@ -42,10 +42,10 @@ index cd1b6155..4d8685d1 100644
 +
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..f27d18fb
+index 00000000..aaf0d576
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,406 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -120,7 +120,6 @@ index 00000000..f27d18fb
 +     */
 +    suspend fun export(songId: String) {
 +        withContext(Dispatchers.IO) {
-+            if (context.dataStore[DownloadFolderExportEnabledKey] == false) return@withContext
 +            exportMutex.withLock { exportLocked(songId) }
 +        }
 +    }
@@ -142,8 +141,9 @@ index 00000000..f27d18fb
 +        val input = song.toTemplateInput()
 +
 +        try {
-+            // Inside the try: export() is fired and forgotten from DownloadUtil's own scope, so a
-+            // preference read failure must not escape as an uncaught exception.
++            // Everything below is inside the try, including the preference reads: export() is fired and
++            // forgotten from DownloadUtil's own scope, so nothing here may escape as an uncaught exception.
++            if (context.dataStore[DownloadFolderExportEnabledKey] == false) return
 +            val template = FolderTemplate.templateOrDefault(context.dataStore[DownloadFolderTemplateKey])
 +            if (FolderTemplate.parse(template).tooDeep) {
 +                Timber.tag(TAG).w(
@@ -199,7 +199,7 @@ index 00000000..f27d18fb
 +        val uri = SafFolders.createFile(context, directory, mimeType, target)
 +            ?: throw IOException("Could not create $target in $directory")
 +        try {
-+            val output = context.contentResolver.openOutputStream(uri, OPEN_MODE_TRUNCATE)
++            val output = context.contentResolver.openOutputStream(uri, OPEN_MODE_WRITE)
 +                ?: throw IOException("Could not open output stream for $uri")
 +            output.use { copyFromCache(songId, it) }
 +        } catch (e: Exception) {
@@ -419,6 +419,8 @@ index 00000000..f27d18fb
 +        length >= 4 && asciiEquals(magic, 0, "fLaC") -> "audio/flac"
 +        length >= 4 && asciiEquals(magic, 0, "OggS") -> "audio/ogg"
 +        length >= 3 && asciiEquals(magic, 0, "ID3") -> "audio/mpeg"
++        // ADTS AAC before the generic MPEG sync check: ADTS shares the 0xFFEx lead-in.
++        length >= 2 && magic[0] == 0xFF.toByte() && magic[1].toInt() and 0xF6 == 0xF0 -> "audio/aac"
 +        length >= 2 && magic[0] == 0xFF.toByte() && magic[1].toInt() and 0xE0 == 0xE0 -> "audio/mpeg"
 +        else -> null
 +    }
@@ -431,7 +433,7 @@ index 00000000..f27d18fb
 +    private companion object {
 +        const val TAG = "DownloadFolderExporter"
 +        const val SUBFOLDER = "Vivi"
-+        const val OPEN_MODE_TRUNCATE = "wt"
++        const val OPEN_MODE_WRITE = "w"
 +        const val PART_SUFFIX = ".part"
 +        const val BUFFER_SIZE = 64 * 1024
 +        const val MAGIC_SIZE = 12
@@ -472,10 +474,10 @@ index df48f9bb..d3725f5b 100644
                                  Download.STATE_STOPPED,
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
 new file mode 100644
-index 00000000..b72899e4
+index 00000000..20eaec66
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,181 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -514,13 +516,14 @@ index 00000000..b72899e4
 +
 +    private val SUPPORTED = setOf("artist", "album", "year", "title", "songid", "quality")
 +    private val TOKEN_PATTERN = Regex("%([A-Za-z]+)%")
-+    private val INVALID_CHARS = Regex("[\\\\/:*?\"<>|]")
++    private val INVALID_CHARS = Regex("[\\\\/:*?\"<>|\\u0000-\\u001F\\u007F]")
 +    private val WHITESPACE = Regex("\\s+")
 +
 +    private const val UNKNOWN_ARTIST = "Unknown Artist"
 +    private const val UNKNOWN_ALBUM = "Unknown Album"
 +    private const val UNKNOWN_YEAR = "Unknown Year"
 +    private const val UNKNOWN_QUALITY = "Unknown Quality"
++    private const val UNKNOWN_TITLE = "Unknown Title"
 +
 +    /**
 +     * The metadata a template can resolve, decoupled from the database entities.
@@ -579,7 +582,9 @@ index 00000000..b72899e4
 +        // to the song id rather than leaving a dangling separator behind, and an imported id can contain
 +        // characters that are illegal in a file name.
 +        val artist = sanitizeSegment(input.artists.joinToString(", ")).ifBlank { UNKNOWN_ARTIST }
-+        val title = sanitizeSegment(input.title.orEmpty()).ifBlank { sanitizeSegment(input.songId) }
++        val title = sanitizeSegment(input.title.orEmpty())
++            .ifBlank { sanitizeSegment(input.songId) }
++            .ifBlank { UNKNOWN_TITLE }
 +        val base = truncateToBytes(
 +            "$artist - $title",
 +            MAX_FILE_NAME_BYTES - MAX_EXTENSION_BYTES,
@@ -644,7 +649,8 @@ index 00000000..b72899e4
 +        val type = mimeType.orEmpty().substringBefore(';').trim().ifEmpty { DEFAULT_MIME_TYPE }
 +        return when {
 +            type.contains("webm") -> ".webm"
-+            type.contains("mp4") || type.contains("aac") -> ".m4a"
++            type.contains("aac") -> ".aac"
++            type.contains("mp4") -> ".m4a"
 +            type.contains("mpeg") -> ".mp3"
 +            type.contains("opus") -> ".opus"
 +            type.contains("ogg") -> ".ogg"
@@ -824,10 +830,10 @@ index 00000000..4520a2af
 +private const val TAG = "SafFolders"
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..caacff7c
+index 00000000..579a05b4
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,305 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -930,21 +936,19 @@ index 00000000..caacff7c
 +    val pickFolder =
 +        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
 +            if (uri != null) {
-+                val persisted = runCatching {
++                runCatching {
 +                    context.contentResolver.takePersistableUriPermission(
 +                        uri,
 +                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
 +                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
 +                    )
-+                }.onFailure { Timber.tag(TAG).w(it, "Could not persist folder permission") }.isSuccess
++                }.onFailure { Timber.tag(TAG).w(it, "Could not persist folder permission") }
 +
-+                if (persisted) {
-+                    // Switching folders must not leak the previous grant, but re-picking the folder
-+                    // that is already configured must not release the grant we just took either.
-+                    if (uri.toString() != folderUri) releasePersistedPermission(context, folderUri)
-+                }
-+                // Stored either way: the grant may still be alive for this session, and the exporter
-+                // falls back to Music/Vivi (and the description says so) when it is not.
++                // Switching folders must not leak the previous grant, whether or not the new one could be
++                // persisted; re-picking the same folder must not release the grant we just took either.
++                if (uri.toString() != folderUri) releasePersistedPermission(context, folderUri)
++                // Stored either way: the grant may still be alive for this session, and the exporter falls
++                // back to Music/Vivi (and the description says so) when it is not.
 +                onFolderUriChange(uri.toString())
 +            }
 +        }
@@ -1180,10 +1184,10 @@ index 00000000..a862f1c1
 +</resources>
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
 new file mode 100644
-index 00000000..9d70dd14
+index 00000000..ccc8de87
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,310 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1392,6 +1396,14 @@ index 00000000..9d70dd14
 +    }
 +
 +    @Test
++    fun `control characters are replaced`() {
++        assertEquals(
++            listOf("a_b_c"),
++            FolderTemplate.expand(input(artists = listOf("a\u0001b\u007Fc")), "%artist%"),
++        )
++    }
++
++    @Test
 +    fun `invalid characters are replaced`() {
 +        assertEquals(
 +            listOf("a_b_c_d_e_f_g_h_i"),
@@ -1446,6 +1458,7 @@ index 00000000..9d70dd14
 +        assertEquals("Metallica - Enter Sandman.ogg", FolderTemplate.fileName(input(), "audio/ogg"))
 +        assertEquals("Metallica - Enter Sandman.opus", FolderTemplate.fileName(input(), "audio/opus"))
 +        assertEquals("Metallica - Enter Sandman.flac", FolderTemplate.fileName(input(), "audio/flac"))
++        assertEquals("Metallica - Enter Sandman.aac", FolderTemplate.fileName(input(), "audio/aac"))
 +        assertEquals("Metallica - Enter Sandman.m4a", FolderTemplate.fileName(input(), null))
 +    }
 +
@@ -1467,6 +1480,14 @@ index 00000000..9d70dd14
 +        assertEquals(
 +            "Unknown Artist - a_b.m4a",
 +            FolderTemplate.fileName(input(title = "..", artists = emptyList(), songId = "a/b"), "audio/mp4"),
++        )
++    }
++
++    @Test
++    fun `file name survives an id that sanitises away`() {
++        assertEquals(
++            "Unknown Artist - Unknown Title.m4a",
++            FolderTemplate.fileName(input(title = "..", artists = emptyList(), songId = ".."), "audio/mp4"),
 +        )
 +    }
 +
