@@ -126,27 +126,28 @@ jobs:
           ./gradlew --console=plain --no-configuration-cache \
             "test${{ steps.inputs.outputs.variant }}UnitTest"
 
-      # Coverage gate for the JVM-testable code (Kover, min 95% line coverage on the filtered scope).
-      # The variant-specific task names are used on purpose: the plain koverXmlReport/koverVerify names
-      # pull in the tests of every flavour and ABI variant (~40 minutes per run).
+      # Coverage gate for the JVM-testable code: koverVerify enforces the 95% line rule configured in
+      # app/build.gradle.kts. The plain task names are used deliberately - the variant-specific
+      # koverXmlReport/koverVerify tasks failed when invoked directly, and the cost of the plain name is
+      # only a longer run. Report parsing below is best-effort; the gate itself is the gradle task.
       - name: Verify coverage
         working-directory: src
         run: |
           set -euo pipefail
-          ./gradlew --console=plain --no-configuration-cache \
-            "koverXmlReport${{ steps.inputs.outputs.variant }}" \
-            "koverVerify${{ steps.inputs.outputs.variant }}"
-          report="$(find . -path '*reports/kover/report.xml' | head -1)"
+          ./gradlew --console=plain --no-configuration-cache koverXmlReport koverVerify
+          report="$(find . -path '*reports/kover/*.xml' | head -1)"
           echo "kover xml report: ${report:-none}"
-          python3 - "${report}" <<'PY'
-          import re, sys
-          path = sys.argv[1]
-          xml = open(path).read()
-          counters = re.findall(r'<counter type="LINE" missed="(\d+)" covered="(\d+)"/>', xml)
-          print("LINE counters found:", len(counters))
-          missed, covered = map(int, counters[-1])
-          print(f"Kover LINE coverage: {covered}/{covered + missed} = {100 * covered / (covered + missed):.1f}%")
-          PY
+          if [[ -n "${report}" ]]; then
+            python3 - "${report}" <<'PY'
+            import re, sys
+            path = sys.argv[1]
+            xml = open(path).read()
+            counters = re.findall(r'<counter type="LINE" missed="(\d+)" covered="(\d+)"/>', xml)
+            print("LINE counters found:", len(counters))
+            missed, covered = map(int, counters[-1])
+            print(f"Kover LINE coverage: {covered}/{covered + missed} = {100 * covered / (covered + missed):.1f}%")
+            PY
+          fi
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
