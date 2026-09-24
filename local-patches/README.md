@@ -63,6 +63,20 @@ Footprint: 7 new files, plus **5 added lines** in three upstream files -
 | API 26-28 exports are not in the media database | They land in `Android/data/<pkg>/files/Music/Vivi`, which the media scanner does not index, so only file managers see them. |
 | Files go directly in the picked folder | No `Vivi` subfolder is created inside a SAF folder the user chose. |
 
+## Coverage gate and named debt
+
+`Local Patch Build` enforces a Kover line-coverage gate of 95% over the JVM-testable scope. The filter
+is explicit in `app/build.gradle.kts`:
+
+- **Measured:** `FolderTemplate` (the pure path and naming rules) - 64/65 lines = **98.5%**.
+- **Excluded, because they need Robolectric or a device:** `DownloadFolderExporter`, `SafFolders`,
+  `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`.
+- **Not measured at all (named debt):** the `canvas`, `innertube` and `lyricsProvider` modules. Wiring
+  Kover into them means build-file contact in modules this patch never touches, and a 95% bound there
+  would likely fail on pre-existing coverage. Agreed with the maintainer to record it as debt.
+- **Pre-existing debt left alone (named):** `lyricsProvider/src/test/kotlin/com/music/musixmatch/MusixmatchTest.kt`
+  `debugKaliUchis` contains no assertions - it prints only.
+
 ## Updating for a new upstream release
 
 Work in a clone of upstream, with the patch applied on a normal branch:
