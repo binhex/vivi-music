@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index cd1b6155..b0de884a 100644
+index cd1b6155..81a9349b 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -14,6 +14,7 @@ plugins {
@@ -18,7 +18,7 @@ index cd1b6155..b0de884a 100644
  
      implementation(libs.activity)
      implementation(libs.hilt.navigation)
-@@ -317,3 +319,21 @@ dependencies {
+@@ -317,3 +319,26 @@ dependencies {
      implementation(libs.androidx.core.splashscreen)
  }
  
@@ -31,6 +31,11 @@ index cd1b6155..b0de884a 100644
 +            includes {
 +                classes("com.music.vivi.playback.FolderTemplate*")
 +            }
++            excludes {
++                // The wildcard above also matches the test class; test code is fully covered and must not
++                // pad the number the gate measures.
++                classes("com.music.vivi.playback.FolderTemplateTest")
++            }
 +        }
 +        verify {
 +            rule {
@@ -42,10 +47,10 @@ index cd1b6155..b0de884a 100644
 +
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..aaf0d576
+index 00000000..9c4df90a
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,406 @@
+@@ -0,0 +1,432 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -194,7 +199,14 @@ index 00000000..aaf0d576
 +        segments: List<String>,
 +    ) {
 +        val directory = SafFolders.resolveDirectory(context, treeUri, segments)
-+        val existing = SafFolders.findFile(context, treeUri, directory, fileName)
++        val found = SafFolders.findFile(context, treeUri, directory, fileName)
++        // A folder that happens to carry the export's name must never be deleted recursively.
++        val existing = if (found != null && SafFolders.isDirectory(context, found)) {
++            Timber.tag(TAG).w("%s is a folder, leaving it alone", fileName)
++            null
++        } else {
++            found
++        }
 +        val target = if (existing == null) fileName else "$fileName$PART_SUFFIX"
 +        val uri = SafFolders.createFile(context, directory, mimeType, target)
 +            ?: throw IOException("Could not create $target in $directory")
@@ -287,8 +299,8 @@ index 00000000..aaf0d576
 +        fileName: String,
 +        relativePath: String,
 +    ) {
-+        val ownedIds = mutableListOf<Long>()
-+        runCatching {
++        val ownedIds = runCatching {
++            val ids = mutableListOf<Long>()
 +            resolver.query(
 +                collection,
 +                arrayOf(MediaStore.Audio.Media._ID, MediaStore.MediaColumns.OWNER_PACKAGE_NAME),
@@ -298,10 +310,29 @@ index 00000000..aaf0d576
 +                null,
 +            )?.use { cursor ->
 +                while (cursor.moveToNext()) {
-+                    if (cursor.getString(1) == context.packageName) ownedIds += cursor.getLong(0)
++                    if (cursor.getString(1) == context.packageName) ids += cursor.getLong(0)
 +                }
 +            }
-+        }.onFailure { Timber.tag(TAG).w(it, "Could not look up a previous export of %s", fileName) }
++            ids
++        }.getOrElse { failure ->
++            // No owner column on this API level: fall back to a name-and-path query. On Q+ the platform
++            // itself refuses to delete rows this app does not own, so a foreign file is still safe.
++            Timber.tag(TAG).w(failure, "Could not filter %s by owner, matching the name only", fileName)
++            runCatching {
++                val ids = mutableListOf<Long>()
++                resolver.query(
++                    collection,
++                    arrayOf(MediaStore.Audio.Media._ID),
++                    "${MediaStore.Audio.Media.DISPLAY_NAME} = ? AND " +
++                        "${MediaStore.Audio.Media.RELATIVE_PATH} = ?",
++                    arrayOf(fileName, "$relativePath/"),
++                    null,
++                )?.use { cursor ->
++                    while (cursor.moveToNext()) ids += cursor.getLong(0)
++                }
++                ids
++            }.getOrElse { emptyList() }
++        }
 +
 +        ownedIds.forEach { id ->
 +            runCatching { resolver.delete(ContentUris.withAppendedId(collection, id), null, null) }
@@ -474,10 +505,10 @@ index df48f9bb..d3725f5b 100644
                                  Download.STATE_STOPPED,
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
 new file mode 100644
-index 00000000..20eaec66
+index 00000000..36583849
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/FolderTemplate.kt
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,189 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -560,8 +591,14 @@ index 00000000..20eaec66
 +    fun parse(template: String): ParseResult {
 +        val segments = normalise(template)
 +        val unknown = segments
-+            .flatMap { segment -> TOKEN_PATTERN.findAll(segment).map { it.value } }
-+            .filterNot { it.drop(1).dropLast(1).lowercase() in SUPPORTED }
++            .flatMap { segment ->
++                val found = TOKEN_PATTERN.findAll(segment).map { it.value }.toList()
++                val unrecognised = found.filterNot { it.drop(1).dropLast(1).lowercase() in SUPPORTED }
++                // A token that the pattern could not consume at all, such as "%genre" or "%%artist%%",
++                // would otherwise be exported as literal text with no warning in the editor.
++                val partial = TOKEN_PATTERN.replace(segment, "").trim()
++                unrecognised + if (partial.contains('%')) listOf(partial) else emptyList()
++            }
 +            .distinct()
 +        // Count the segments this template will really contribute. Tokens are unresolved here, so a token
 +        // that resolves to nothing at export time can still make this count one too high.
@@ -589,7 +626,8 @@ index 00000000..20eaec66
 +            "$artist - $title",
 +            MAX_FILE_NAME_BYTES - MAX_EXTENSION_BYTES,
 +        ).trimEnd('.', ' ')
-+        return base
++        // A dot-leading name is hidden from file managers and from the API 26-28 media scanner.
++        return if (base.startsWith('.')) truncateToBytes("_$base", MAX_FILE_NAME_BYTES - MAX_EXTENSION_BYTES) else base
 +    }
 +
 +    /** `Artist - Title.ext`, the name the exporter writes. */
@@ -651,7 +689,8 @@ index 00000000..20eaec66
 +            type.contains("webm") -> ".webm"
 +            type.contains("aac") -> ".aac"
 +            type.contains("mp4") -> ".m4a"
-+            type.contains("mpeg") -> ".mp3"
++            // Exact match: a playlist mime such as application/x-mpegURL is not an MP3 stream.
++            type == "audio/mpeg" || type == "audio/mp3" -> ".mp3"
 +            type.contains("opus") -> ".opus"
 +            type.contains("ogg") -> ".ogg"
 +            type.contains("flac") -> ".flac"
@@ -691,7 +730,7 @@ index 00000000..c918728c
 +val DownloadFolderTemplateKey = stringPreferencesKey("downloadFolderTemplate")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 new file mode 100644
-index 00000000..4520a2af
+index 00000000..9a5cdc00
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 @@ -0,0 +1,133 @@
@@ -794,7 +833,7 @@ index 00000000..4520a2af
 +            )
 +        }.getOrNull()
 +
-+    private fun isDirectory(context: Context, uri: Uri): Boolean =
++    fun isDirectory(context: Context, uri: Uri): Boolean =
 +        query(context, uri, arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE)) { cursor ->
 +            cursor.getString(0) == DocumentsContract.Document.MIME_TYPE_DIR
 +        } ?: false
@@ -830,10 +869,10 @@ index 00000000..4520a2af
 +private const val TAG = "SafFolders"
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..579a05b4
+index 00000000..2ada89b2
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,307 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -914,7 +953,9 @@ index 00000000..579a05b4
 +    }
 +
 +    var folderName by remember(folderUri) { mutableStateOf<String?>(null) }
-+    var resolving by remember(folderUri) { mutableStateOf(false) }
++    // Starts true when a folder is configured, so the description does not flash "access lost" before the
++    // provider answers.
++    var resolving by remember(folderUri) { mutableStateOf(folderUri.isNotBlank()) }
 +
 +    // Resolving the display name touches the documents provider, so keep it off the main thread. A
 +    // null result is how a revoked grant shows up: the provider throws, and SafFolders reports null.
@@ -1184,10 +1225,10 @@ index 00000000..a862f1c1
 +</resources>
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
 new file mode 100644
-index 00000000..ccc8de87
+index 00000000..2ab40789
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/FolderTemplateTest.kt
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,323 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1251,6 +1292,12 @@ index 00000000..ccc8de87
 +        val result = FolderTemplate.parse("%artist%/..///%album%/%year%/%title%/%songId%/%quality%")
 +        assertFalse(result.tooDeep)
 +        assertTrue(result.isValid)
++    }
++
++    @Test
++    fun `parse flags a token the pattern cannot consume`() {
++        assertEquals(listOf("%genre"), FolderTemplate.parse("%artist%/%genre").unknownTokens)
++        assertEquals(listOf("%%"), FolderTemplate.parse("%%artist%%").unknownTokens)
 +    }
 +
 +    @Test
@@ -1442,6 +1489,11 @@ index 00000000..ccc8de87
 +    }
 +
 +    @Test
++    fun `file name never starts with a dot`() {
++        assertEquals("_.38 Special - Enter Sandman", FolderTemplate.fileNameBase(input(artists = listOf(".38 Special"))))
++    }
++
++    @Test
 +    fun `file name keeps the artist title shape`() {
 +        assertEquals("Metallica - Enter Sandman.m4a", FolderTemplate.fileName(input(), "audio/mp4"))
 +    }
@@ -1459,6 +1511,8 @@ index 00000000..ccc8de87
 +        assertEquals("Metallica - Enter Sandman.opus", FolderTemplate.fileName(input(), "audio/opus"))
 +        assertEquals("Metallica - Enter Sandman.flac", FolderTemplate.fileName(input(), "audio/flac"))
 +        assertEquals("Metallica - Enter Sandman.aac", FolderTemplate.fileName(input(), "audio/aac"))
++        assertEquals(".m4a", FolderTemplate.extensionFor("application/x-mpegURL"))
++        assertEquals(".mp3", FolderTemplate.extensionFor("audio/mpeg"))
 +        assertEquals("Metallica - Enter Sandman.m4a", FolderTemplate.fileName(input(), null))
 +    }
 +
