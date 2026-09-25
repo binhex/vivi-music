@@ -39,7 +39,12 @@ in a file manager or any other music player:
   *Settings -> Storage -> Download format -> Folder format*. It defaults to `%artist%/%album%`;
   `%artist%`, `%album%`, `%year%`, `%title%`, `%songId%`, `%quality%` and `%tracknumber%` are supported,
   an unresolvable token becomes `Unknown Artist` / `Unknown Album` / `Unknown Year` / `Unknown Quality`,
-  and an explicitly emptied template means flat output directly in the root.
+  and an explicitly emptied template means flat output directly in the root. In a *folder* format
+  `%artist%` is the artist the album is filed under - the credited album artist when the library knows it,
+  or the fixed `Various Artists` for a compilation, defined as an album whose credit performs none of its
+  tracks, or (with no credit stored) one shared by at least two performers where no performer owns half of
+  it. The *file-name* format keeps using the track's own artist, so a compilation's folder is uniform while
+  each file name still names its performer.
 - Optional **file-name** template in *Settings -> Storage -> Download format -> File format*, defaulting to
   `%artist% - %album% - %tracknumber% - %title%`, so an album download lands as
   `Metallica - Master Of Puppets - 10 - Battery.webm` and sorts in album order. A part whose token has no
@@ -54,11 +59,12 @@ in a file manager or any other music player:
 - The private Media3 download cache is never modified, so an export failure cannot break offline
   playback: the copy is read from the cache and only the new file is touched.
 
-Footprint: 7 new files, plus **32 added lines** in four upstream files -
+Footprint: 9 new files, plus **58 added lines** in four upstream files -
 `DownloadUtil.kt` (constructor parameter + one call in the `STATE_COMPLETED` branch),
 `StorageSettings.kt` (one call to `LocalDownloadSettingsGroup()`),
-`app/build.gradle.kts` (Kover wiring and `testImplementation(libs.junit)` for the new unit tests) and
-`DatabaseDao.kt` (a three-line suspend query for the album position).
+`app/build.gradle.kts` (Kover wiring, the `AlbumArtist*` coverage scope and `testImplementation(libs.junit)`)
+and `DatabaseDao.kt` (a suspend query for the album position plus three for the album's credited artists
+and performer spread).
 
 ## Known limitations (accepted for now)
 
@@ -70,6 +76,10 @@ Footprint: 7 new files, plus **32 added lines** in four upstream files -
 | A directory carries the export's name | A child that is a folder is left alone and logged, so a folder is never deleted recursively. The export is then staged under the requested name, which the provider uniquifies, so repeated exports add copies rather than replacing that name. |
 | A cancelled export still finishes the copy | The copy loop has no suspension points (blocking IO on purpose), so cancellation is observed after the file is written. The result is correct and idempotent. |
 | The new strings are English only | The `download_folder*` and `download_format*` strings live in the default locale; every other locale falls back to English until translated. |
+| A credit that performs nothing becomes `Various Artists` | An album credited to a composer, a label or a compilation pseudo-artist rather than to its performers is filed under `Various Artists`. That credit is deliberately discarded: it is not a name the album's files belong under, and matching the localised text of the pseudo-artist instead would make the folder tree depend on the app language. |
+| A two-track release by two artists is not detected | The performer-spread rule needs the top performer to own *under* half of the album, and on a two-track release one performer owns exactly half, so such an album is not treated as a compilation and each track keeps its own artist folder - the split this patch removes for larger compilations. The credited-artist rule still catches it whenever the album header was stored. |
+| Rule B divides by the stored track list, not by the tracks that have artist data | `albumSongCount` counts every song the album has stored, including tracks whose metadata lists no artist. An album where the top known performer owns most of the tracks *with* artist data can therefore still be filed under `Various Artists`. The credited-artist rule (Rule A) is unaffected. |
+| Rule A compares names, so a different script or romanisation can misfile an album | Only whitespace, case, a trailing `- Topic` and a closed bracket-tag list are unified. A credit stored in a different script or romanisation from the performer (a native-script credit against romanised track rows, for example) therefore looks like "the credit performs none of the album" and the album is filed under `Various Artists`. The design deliberately trades that failure class for language independence. |
 | Windows-reserved names are not rewritten | `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` and `LPT1`-`LPT9` pass the sanitiser. Harmless on Android, but a tree copied to Windows or written to FAT/OTG media can be awkward to open. |
 | The SAF folder is treated as Vivi's own export folder | SAF has no ownership column (unlike MediaStore's `OWNER_PACKAGE_NAME`), so an existing file with the same name is replaced. Point the feature at a dedicated folder if it already holds files from other tools. |
 | A foreign file with the exact same name makes MediaStore rename ours | Our copy becomes `Name (1).m4a`, and later re-exports add `(2)`, `(3)`... because cleanup matches the exact display name. |
@@ -90,12 +100,14 @@ Footprint: 7 new files, plus **32 added lines** in four upstream files -
 `Local Patch Build` enforces a Kover line-coverage gate of 95% over the JVM-testable scope. The filter
 is explicit in `app/build.gradle.kts`:
 
-- **Measured:** `DownloadFormat` (the pure token, path and naming rules) - a local JaCoCo run over the full
-  unit suite reports 155/155 lines = **100%**; CI enforces the 95% bound with the Kover `includes` filter
-  `com.music.vivi.playback.DownloadFormat*`.
+- **Measured:** `DownloadFormat` (the pure token, path and naming rules) and `AlbumArtist` (the pure
+  album-artist rule) - a local JaCoCo run over the full unit suite reports 137/137 and 15/15 lines =
+  **100%**; CI enforces the 95% bound with the Kover `includes` filters
+  `com.music.vivi.playback.DownloadFormat*` and `com.music.vivi.playback.AlbumArtist*`.
 - **Excluded from the measured scope, because they need Robolectric or a device:** `DownloadFolderExporter`,
   `SafFolders`, `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`. The gate's `includes` filter
-  limits measurement to `DownloadFormat*`, so these are named debt here rather than listed in the build file.
+  limits measurement to `DownloadFormat*` and `AlbumArtist*`, so these are named debt here rather than
+  listed in the build file.
 - **Not measured at all (named debt):** the `canvas`, `innertube` and `lyricsProvider` modules. Wiring
   Kover into them means build-file contact in modules this patch never touches, and a 95% bound there
   would likely fail on pre-existing coverage. Agreed with the maintainer to record it as debt.

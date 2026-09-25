@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index cd1b6155..6e8b78b4 100644
+index cd1b6155..b06360fe 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -14,6 +14,7 @@ plugins {
@@ -36,23 +36,25 @@ index cd1b6155..6e8b78b4 100644
  
      implementation(libs.activity)
      implementation(libs.hilt.navigation)
-@@ -317,3 +319,26 @@ dependencies {
+@@ -317,3 +319,28 @@ dependencies {
      implementation(libs.androidx.core.splashscreen)
  }
  
-+// Coverage gate for the JVM-testable code. The scope is deliberately limited to DownloadFormat, the pure
-+// path and naming rules: the rest of this patch depends on Android, Hilt, Media3 or Compose and would need
-+// Robolectric or a device. That excluded debt is recorded in the fork README, not here.
++// Coverage gate for the JVM-testable code. The scope is the pure rules - the folder and file-name
++// templates and the album-artist rule: the rest of this patch depends on Android, Hilt, Media3 or Compose
++// and would need Robolectric or a device. That excluded debt is recorded in the fork README, not here.
 +kover {
 +    reports {
 +        filters {
 +            includes {
 +                classes("com.music.vivi.playback.DownloadFormat*")
++                classes("com.music.vivi.playback.AlbumArtist*")
 +            }
 +            excludes {
 +                // The wildcard above also matches the test class; test code is fully covered and must not
 +                // pad the number the gate measures.
 +                classes("com.music.vivi.playback.DownloadFormatTest")
++                classes("com.music.vivi.playback.AlbumArtistTest")
 +            }
 +        }
 +        verify {
@@ -64,25 +66,157 @@ index cd1b6155..6e8b78b4 100644
 +}
 +
 diff --git a/app/src/main/kotlin/com/music/vivi/db/DatabaseDao.kt b/app/src/main/kotlin/com/music/vivi/db/DatabaseDao.kt
-index 3eebab59..ddb47228 100644
+index 3eebab59..57fb5306 100644
 --- a/app/src/main/kotlin/com/music/vivi/db/DatabaseDao.kt
 +++ b/app/src/main/kotlin/com/music/vivi/db/DatabaseDao.kt
-@@ -588,6 +588,9 @@ interface DatabaseDao {
+@@ -54,6 +54,7 @@ import com.music.vivi.extensions.reversed
+ import com.music.vivi.extensions.toSQLiteQuery
+ import com.music.vivi.models.MediaMetadata
+ import com.music.vivi.models.toMediaMetadata
++import com.music.vivi.playback.AlbumPerformerTracks
+ import com.music.vivi.ui.utils.resize
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.first
+@@ -588,6 +589,40 @@ interface DatabaseDao {
      @Transaction
      @Query("SELECT * FROM song WHERE id = :songId LIMIT 1")
      suspend fun getSongById(songId: String): Song?
 +    /** The position of [songId] within [albumId] in `song_album_map` (0-based), or null when there is no row. */
 +    @Query("SELECT `index` FROM song_album_map WHERE songId = :songId AND albumId = :albumId LIMIT 1")
 +    suspend fun albumIndex(songId: String, albumId: String): Int?
++
++    /**
++     * The artists an album is credited to, in display order. Empty when the album header was never stored,
++     * which is the case for a download taken straight from search or a playlist.
++     */
++    @Query(
++        "SELECT artist.name FROM album_artist_map JOIN artist ON album_artist_map.artistId = artist.id " +
++            "WHERE album_artist_map.albumId = :albumId ORDER BY album_artist_map.`order`",
++    )
++    suspend fun albumCreditedArtists(albumId: String): List<String>
++
++    /**
++     * How many of the album's songs each performer is credited on, most credited first. `DISTINCT songId`
++     * because one song can carry several performers, and the count is what the performer-spread rule
++     * compares against [albumSongCount].
++     */
++    @Query(
++        "SELECT artist.name AS artist, COUNT(DISTINCT song_album_map.songId) AS tracks " +
++            "FROM song_artist_map " +
++            "JOIN song_album_map ON song_artist_map.songId = song_album_map.songId " +
++            "JOIN artist ON song_artist_map.artistId = artist.id " +
++            "WHERE song_album_map.albumId = :albumId GROUP BY artist.id ORDER BY tracks DESC",
++    )
++    suspend fun albumPerformerTracks(albumId: String): List<AlbumPerformerTracks>
++
++    /**
++     * How many songs `song_album_map` holds for the album - its fetched track list, which is every track of
++     * a browsed album and not only the tracks in the library - the denominator of the performer-spread rule.
++     */
++    @Query("SELECT COUNT(DISTINCT songId) FROM song_album_map WHERE albumId = :albumId")
++    suspend fun albumSongCount(albumId: String): Int
  
      @Transaction
      @Query("SELECT * FROM song WHERE id = :songId LIMIT 1")
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/AlbumArtist.kt b/app/src/main/kotlin/com/music/vivi/playback/AlbumArtist.kt
+new file mode 100644
+index 00000000..19e3373f
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/AlbumArtist.kt
+@@ -0,0 +1,87 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++/**
++ * The one folder name a compilation is filed under.
++ *
++ * Deliberately English and not localised, for the same reason as `Unknown Artist` in [DownloadFormat]: a
++ * folder tree must not change when the user changes the app language.
++ */
++const val VARIOUS_ARTISTS = "Various Artists"
++
++/**
++ * One performer of an album and the number of that album's songs the performer is credited on.
++ *
++ * A Room projection of the grouped `song_artist_map` query in `DatabaseDao.albumPerformerTracks`: the
++ * property names are the column names, so no Room import is needed and this file stays pure Kotlin.
++ */
++data class AlbumPerformerTracks(
++    val artist: String,
++    val tracks: Int,
++)
++
++/**
++ * The artist a downloaded album is filed under, or null when the library knows nothing better than the
++ * track's own artist.
++ *
++ * Two rules, in order:
++ *
++ * - **Credited mismatch**: the album has credited artists, at least one performer row exists, and no
++ *   credited artist performs any of the album's songs. A compilation's album header credits an artist that
++ *   is not on it - on YouTube Music the localised "Various Artists" pseudo-artist, elsewhere a composer or
++ *   label credit - and that credit is not the folder its files belong under, so the fixed [VARIOUS_ARTISTS]
++ *   name is used instead. Comparing names rather than looking for the pseudo-artist's missing channel link
++ *   is what keeps this independent of the app language.
++ * - **Performer spread**: with no credited artists stored at all, the album is a compilation when at least
++ *   two performers share it and the most credited one owns under half of it (`top * 2 < albumSongCount`).
++ *   The half rule keeps one guest verse from moving a whole album: 10 of 11 tracks is not a compilation,
++ *   6 tracks by 6 artists is.
++ *
++ * @param creditedArtists the album's credited artists in display order, as stored in `album_artist_map`
++ * @param performerTracks one row per artist credited on the album's songs, with that artist's song count
++ * @param albumSongCount every song the album has stored, including the ones whose performer is
++ *   unknown, so rule two needs the top performer to own under half of the album rather than under half
++ *   of the tracks that happen to carry artist data
++ */
++internal fun folderArtists(
++    creditedArtists: List<String>,
++    performerTracks: List<AlbumPerformerTracks>,
++    albumSongCount: Int,
++): List<String>? {
++    val credited = creditedArtists.namedDistinct()
++    val performers = performerTracks.tracksByPerformer()
++    val top = performers.values.maxOrNull() ?: 0
++    return when {
++        credited.isNotEmpty() && performers.isNotEmpty() && credited.none { it.normalised() in performers } ->
++            listOf(VARIOUS_ARTISTS)
++        credited.isNotEmpty() -> credited
++        performers.size >= 2 && top * 2 < albumSongCount -> listOf(VARIOUS_ARTISTS)
++        else -> null
++    }
++}
++
++/** The trimmed spelling, in order, with blank names dropped and case-insensitive duplicates removed. */
++private fun List<String>.namedDistinct(): List<String> =
++    mapNotNull { name -> name.trim().takeIf { it.isNotEmpty() } }
++        .distinctBy { it.normalised() }
++
++/**
++ * Song counts per performer, summed across the duplicate `artist` rows the schema can hold for one name.
++ * An artist credited on none of the album's songs cannot skew the spread, so it is dropped.
++ */
++private fun List<AlbumPerformerTracks>.tracksByPerformer(): Map<String, Int> =
++    groupBy { it.artist.normalised() }
++        .mapValues { (_, rows) -> rows.sumOf { it.tracks } }
++        .filterValues { it > 0 }
++
++/**
++ * The form every name comparison in this file uses: trimmed, case-folded, and tidied exactly the way the
++ * naming rules tidy a name. Tidying is what lets the comparison treat `Metallica - Topic` and `Metallica`
++ * as one artist, so a credited name that only carries a video suffix is not mistaken for a stranger who
++ * performs none of the album - which would file a normal album under `Various Artists`.
++ */
++private fun String.normalised(): String = DownloadFormat.tidyArtist(trim().lowercase())
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
 new file mode 100644
-index 00000000..c48a7170
+index 00000000..b8416caf
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt
-@@ -0,0 +1,447 @@
+@@ -0,0 +1,484 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -182,9 +316,16 @@ index 00000000..c48a7170
 +            // preference reads: export() is fired and forgotten from DownloadUtil's own scope, so nothing
 +            // here may escape as an uncaught exception.
 +            val cleanUp = context.dataStore[DownloadFormatCleanKey] != false
-+            val input = song.toTemplateInput(albumPosition(songId, song.album?.id))
-+                .let { if (cleanUp) it.cleaned() else it }
++            // The template is read first so a folder format that does not use %artist% costs no
++            // album-artist lookups at all, the same way a disabled feature costs no database read.
 +            val folderTemplate = DownloadFormat.templateOrDefault(context.dataStore[DownloadFolderTemplateKey])
++            val albumArtists = if (DownloadFormat.usesArtistToken(folderTemplate)) {
++                albumFolderArtists(database, song.album?.id)
++            } else {
++                null
++            }
++            val input = song.toTemplateInput(albumPosition(songId, song.album?.id), albumArtists)
++                .let { if (cleanUp) it.cleaned() else it }
 +            if (DownloadFormat.resolvedSegments(input, folderTemplate).size > DownloadFormat.MAX_SEGMENTS) {
 +                Timber.tag(TAG).w(
 +                    "Template resolves to more than %d folders, the extra ones are ignored",
@@ -519,7 +660,10 @@ index 00000000..c48a7170
 +}
 +
 +/** Maps a library row onto the metadata the format can resolve. */
-+internal fun Song.toTemplateInput(trackNumber: Int? = null) = DownloadFormat.Input(
++internal fun Song.toTemplateInput(
++    trackNumber: Int? = null,
++    folderArtists: List<String>? = null,
++) = DownloadFormat.Input(
 +    songId = id,
 +    title = song.title,
 +    artists = artists.map { it.name },
@@ -529,13 +673,40 @@ index 00000000..c48a7170
 +    albumYear = album?.year,
 +    bitrate = format?.bitrate,
 +    trackNumber = trackNumber,
++    folderArtists = folderArtists,
 +)
++
++/**
++ * The artist an album's downloads are filed under, or null when the library knows nothing better than the
++ * track's own artists.
++ *
++ * Best effort in the same shape as the exporter's own album-position lookup: an export is fired and
++ * forgotten, so a failing lookup logs and returns null rather than failing the export or losing a
++ * download. Shared with the settings preview, which is why it is not private.
++ */
++internal suspend fun albumFolderArtists(database: MusicDatabase, albumId: String?): List<String>? = try {
++    albumId?.let { id ->
++        folderArtists(
++            creditedArtists = database.albumCreditedArtists(id),
++            performerTracks = database.albumPerformerTracks(id),
++            albumSongCount = database.albumSongCount(id),
++        )
++    }
++} catch (e: CancellationException) {
++    throw e
++} catch (e: Exception) {
++    Timber.tag(ALBUM_ARTIST_TAG).w(e, "Could not read the artists of album %s", albumId)
++    null
++}
++
++/** Tag for the lookup above; the exporter class keeps its own TAG for the export path. */
++private const val ALBUM_ARTIST_TAG = "AlbumArtist"
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt
 new file mode 100644
-index 00000000..ab525414
+index 00000000..6961b221
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,374 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -566,8 +737,11 @@ index 00000000..ab525414
 +
 +    const val DEFAULT_MIME_TYPE = "audio/mp4"
 +
++    /** The folder token whose meaning the album-artist rule changes; named for the editor's explanation. */
++    const val ARTIST_TOKEN = "%artist%"
++
 +    /** Tokens offered as chips in the editor, in display order. */
-+    val TOKENS = listOf("%artist%", "%album%", "%year%", "%title%", "%songId%", "%quality%", "%tracknumber%")
++    val TOKENS = listOf(ARTIST_TOKEN, "%album%", "%year%", "%title%", "%songId%", "%quality%", "%tracknumber%")
 +
 +    private val SUPPORTED = setOf("artist", "album", "year", "title", "songid", "quality", "tracknumber")
 +    private val TOKEN_PATTERN = Regex("%([A-Za-z]+)%")
@@ -620,6 +794,13 @@ index 00000000..ab525414
 +        val bitrate: Int?,
 +        /** Album position from `song_album_map`, 1-based. Null when the song has no album row. */
 +        val trackNumber: Int? = null,
++        /**
++         * The artists a *folder* is filed under: the album's credited artists, or `["Various Artists"]`
++         * for a compilation. Null or blank falls back to [artists], which keeps an export working when the
++         * library knows nothing about the album. The file-name template always uses [artists], so the
++         * performer of each track stays visible in the file name.
++         */
++        val folderArtists: List<String>? = null,
 +    ) {
 +        /**
 +         * The same metadata with the tidy pass applied, so `%artist%`, `%album%` and `%title%` agree whether
@@ -631,6 +812,7 @@ index 00000000..ab525414
 +            artists = artists.map(::tidyArtist),
 +            albumTitle = albumTitle?.let(::tidyMetadata),
 +            storedAlbumName = storedAlbumName?.let(::tidyMetadata),
++            folderArtists = folderArtists?.map(::tidyArtist),
 +        )
 +    }
 +
@@ -653,6 +835,13 @@ index 00000000..ab525414
 +     */
 +    fun fileTemplateOrDefault(stored: String?): String =
 +        stored?.takeIf { it.isNotBlank() } ?: DEFAULT_FILE_TEMPLATE
++
++    /**
++     * Whether [template] uses the `%artist%` token, whatever its case. The exporter asks this before it
++     * reads an album's artists, so a template that does not use the token costs no album-artist reads.
++     */
++    internal fun usesArtistToken(template: String): Boolean =
++        TOKEN_PATTERN.findAll(template).any { it.groupValues[1].equals("artist", ignoreCase = true) }
 +
 +    fun parse(template: String): ParseResult {
 +        val segments = normalise(template)
@@ -746,13 +935,13 @@ index 00000000..ab525414
 +     * spelling instead of being folded to lower case.
 +     *
 +     * [forFileName] switches two behaviours. A folder must always exist, so an absent value becomes its
-+     * `Unknown *` fallback and the tree stays predictable. A file name must not invent values, so an
-+     * absent value becomes empty and its whole part is dropped - except the title, which must never be
-+     * lost, and so still falls back to the song id.
++     * `Unknown *` fallback and the tree stays predictable; the title still falls back to the song id and
++     * the track number still drops its whole part, because neither may be invented. A file name must not
++     * invent values, so an absent value becomes empty and its whole part is dropped - except the title,
++     * which must never be lost, and so still falls back to the song id.
 +     */
 +    private fun resolve(token: String, literal: String, input: Input, forFileName: Boolean): String = when (token) {
-+        "artist" -> input.artists.joinToString(", ")
-+            .ifBlank { if (forFileName) "" else UNKNOWN_ARTIST }
++        "artist" -> artistText(input, forFileName)
 +        "album" -> (input.albumTitle ?: input.storedAlbumName).orEmpty()
 +            .ifBlank { if (forFileName) "" else UNKNOWN_ALBUM }
 +        "year" -> (input.songYear ?: input.albumYear)?.toString()
@@ -764,6 +953,20 @@ index 00000000..ab525414
 +        "tracknumber" -> trackNumberText(input.trackNumber)
 +        else -> literal
 +    }
++
++    /**
++     * A folder is filed under the album's artist - the credited artists, or `Various Artists` for a
++     * compilation - while a file name keeps the performer of that track, so the two templates disagree on
++     * purpose. Everything else about the token, including the `Unknown Artist` placeholder, is unchanged.
++     */
++    private fun artistText(input: Input, forFileName: Boolean): String {
++        val names = if (forFileName) input.artists else input.folderArtists.namedOrNull() ?: input.artists
++        return names.joinToString(", ").ifBlank { if (forFileName) "" else UNKNOWN_ARTIST }
++    }
++
++    /** A list that is missing, empty or only blank names counts as absent. */
++    private fun List<String>?.namedOrNull(): List<String>? =
++        this?.filter { it.isNotBlank() }?.takeIf { it.isNotEmpty() }
 +
 +    /**
 +     * The title never disappears from a file name; a folder segment is allowed to sanitise away.
@@ -1076,10 +1279,10 @@ index 00000000..a33e48bb
 +private const val TAG = "SafFolders"
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..62b8598f
+index 00000000..e645af31
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,447 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1127,6 +1330,7 @@ index 00000000..62b8598f
 +import com.music.vivi.playback.DownloadFormatCleanKey
 +import com.music.vivi.playback.DownloadFormatFileKey
 +import com.music.vivi.playback.SafFolders
++import com.music.vivi.playback.albumFolderArtists
 +import com.music.vivi.playback.toTemplateInput
 +import com.music.vivi.ui.component.ActionPromptDialog
 +import com.music.vivi.ui.component.ExpressiveSettingGroup
@@ -1162,28 +1366,38 @@ index 00000000..62b8598f
 +    var editing by remember { mutableStateOf<FormatField?>(null) }
 +    var sampleSong by remember { mutableStateOf<Song?>(null) }
 +    var sampleTrackNumber by remember { mutableStateOf<Int?>(null) }
++    var sampleFolderArtists by remember { mutableStateOf<List<String>?>(null) }
 +
 +    // A real downloaded song makes the preview honest; the library may be empty. The read is guarded: an
 +    // exception escaping a LaunchedEffect would crash the settings screen, and the static example below
 +    // already covers the "nothing to show" case.
 +    LaunchedEffect(Unit) {
-+        val sample: Pair<Song?, Int?> = try {
++        var found: Song? = null
++        var foundTrackNumber: Int? = null
++        var foundFolderArtists: List<String>? = null
++        try {
 +            withContext(Dispatchers.IO) {
-+                val found = database.downloadedSongsByCreateDateAsc().first().lastOrNull()
-+                found to found?.let { downloaded ->
-+                    downloaded.album?.id?.let { albumId ->
-+                        database.albumIndex(downloaded.id, albumId)?.plus(1)
-+                    }
++                val song = database.downloadedSongsByCreateDateAsc().first().lastOrNull()
++                found = song
++                val albumId = song?.album?.id
++                if (song != null && albumId != null) {
++                    foundTrackNumber = database.albumIndex(song.id, albumId)?.plus(1)
++                    // The preview must resolve the album artist the same way the exporter does, otherwise
++                    // the dialog would promise a path the export does not write.
++                    foundFolderArtists = albumFolderArtists(database, albumId)
 +                }
 +            }
 +        } catch (e: CancellationException) {
 +            throw e
 +        } catch (e: Exception) {
 +            Timber.tag(TAG).w(e, "Could not read a preview song, using the example")
-+            null to null
++            found = null
++            foundTrackNumber = null
++            foundFolderArtists = null
 +        }
-+        sampleSong = sample.first
-+        sampleTrackNumber = sample.second
++        sampleSong = found
++        sampleTrackNumber = foundTrackNumber
++        sampleFolderArtists = foundFolderArtists
 +    }
 +
 +    var folderName by remember(folderUri) { mutableStateOf<String?>(null) }
@@ -1318,6 +1532,7 @@ index 00000000..62b8598f
 +            rootLabel = folderName ?: stringResource(R.string.download_folder_default_root),
 +            sampleSong = sampleSong,
 +            sampleTrackNumber = sampleTrackNumber,
++            sampleFolderArtists = sampleFolderArtists,
 +            cleanUp = cleanUp,
 +            onDismiss = { editing = null },
 +            onSave = { saved, cleanUpDraft ->
@@ -1355,6 +1570,7 @@ index 00000000..62b8598f
 +    rootLabel: String,
 +    sampleSong: Song?,
 +    sampleTrackNumber: Int?,
++    sampleFolderArtists: List<String>?,
 +    cleanUp: Boolean,
 +    onDismiss: () -> Unit,
 +    onSave: (String, Boolean) -> Unit,
@@ -1379,7 +1595,7 @@ index 00000000..62b8598f
 +        bitrate = 256_000,
 +        trackNumber = 10,
 +    )
-+    val rawInput = sampleSong?.toTemplateInput(sampleTrackNumber) ?: example
++    val rawInput = sampleSong?.toTemplateInput(sampleTrackNumber, sampleFolderArtists) ?: example
 +    val previewInput = if (cleanUpDraft) rawInput.cleaned() else rawInput
 +    // The draft is previewed, so the effect of an edit is visible before saving.
 +    val previewFolders = DownloadFormat.expand(
@@ -1465,6 +1681,16 @@ index 00000000..62b8598f
 +                modifier = Modifier.padding(top = 8.dp),
 +                style = MaterialTheme.typography.bodySmall,
 +            )
++            if (!editingFile) {
++                Text(
++                    text = stringResource(
++                        R.string.download_folder_artist_note,
++                        DownloadFormat.ARTIST_TOKEN,
++                    ),
++                    modifier = Modifier.padding(top = 8.dp),
++                    style = MaterialTheme.typography.bodySmall,
++                )
++            }
 +            // Cleaning changes folder names as well as file names, so the switch is explained where the
 +            // naming rules live.
 +            if (editingFile) {
@@ -1519,10 +1745,10 @@ index aa40ee3e..19d47e14 100644
              items = listOf(
 diff --git a/app/src/main/res/values/local_download_strings.xml b/app/src/main/res/values/local_download_strings.xml
 new file mode 100644
-index 00000000..f78e8af1
+index 00000000..86313bba
 --- /dev/null
 +++ b/app/src/main/res/values/local_download_strings.xml
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,30 @@
 +<?xml version="1.0" encoding="utf-8"?>
 +<!--
 +  Strings for the "save downloads to a folder" patch.
@@ -1541,6 +1767,7 @@ index 00000000..f78e8af1
 +    <string name="download_folder_permission_lost">Folder access lost, using Music/Vivi. Choose the folder again.</string>
 +    <string name="download_folder_structure_flat">Flat - save directly in the chosen folder</string>
 +    <string name="download_folder_structure_hint">Use the tokens below, separated by /. Leave empty to save directly in the chosen folder.</string>
++    <string name="download_folder_artist_note">%1$s is the album artist; compilations use Various Artists.</string>
 +    <string name="download_folder_structure_preview">Preview</string>
 +    <string name="download_folder_structure_unknown_token">Unknown token: %1$s</string>
 +    <string name="download_folder_structure_too_deep">Only the first 6 folders are used</string>
@@ -1552,12 +1779,220 @@ index 00000000..f78e8af1
 +    <string name="download_format_clean">Clean up names</string>
 +    <string name="download_format_clean_desc">Removes trailing video tags such as (Official Video) and [HD], and - Topic after artist names</string>
 +</resources>
+diff --git a/app/src/test/kotlin/com/music/vivi/playback/AlbumArtistTest.kt b/app/src/test/kotlin/com/music/vivi/playback/AlbumArtistTest.kt
+new file mode 100644
+index 00000000..c275c447
+--- /dev/null
++++ b/app/src/test/kotlin/com/music/vivi/playback/AlbumArtistTest.kt
+@@ -0,0 +1,202 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++class AlbumArtistTest {
++
++    private fun performers(vararg tracks: Pair<String, Int>) =
++        tracks.map { (artist, count) -> AlbumPerformerTracks(artist = artist, tracks = count) }
++
++    @Test
++    fun `a credit that performs nothing makes the album a compilation`() {
++        val result = folderArtists(
++            creditedArtists = listOf("Various Artists"),
++            performerTracks = performers("HYOLYN" to 1, "WJSN" to 1, "Kep1er" to 1),
++            albumSongCount = 6,
++        )
++        assertEquals(listOf("Various Artists"), result)
++    }
++
++    @Test
++    fun `a localised credit becomes the fixed English folder name`() {
++        val result = folderArtists(
++            creditedArtists = listOf("Verschiedene Interpreten"),
++            performerTracks = performers("HYOLYN" to 1, "WJSN" to 1, "Kep1er" to 1),
++            albumSongCount = 6,
++        )
++        assertEquals(listOf(VARIOUS_ARTISTS), result)
++    }
++
++    @Test
++    fun `credits that perform the album are used as the folder`() {
++        val result = folderArtists(
++            creditedArtists = listOf("Metallica"),
++            performerTracks = performers("Metallica" to 10, "The Guest" to 1),
++            albumSongCount = 11,
++        )
++        assertEquals(listOf("Metallica"), result)
++    }
++
++    @Test
++    fun `a credit list keeps its order and drops duplicates and blanks`() {
++        val result = folderArtists(
++            creditedArtists = listOf("A", "B", "a", "  "),
++            performerTracks = performers("A" to 5, "B" to 5),
++            albumSongCount = 10,
++        )
++        assertEquals(listOf("A", "B"), result)
++    }
++
++    @Test
++    fun `a split credit that someone performs is not a compilation`() {
++        val result = folderArtists(
++            creditedArtists = listOf("A", "B"),
++            performerTracks = performers("A" to 5, "B" to 5),
++            albumSongCount = 10,
++        )
++        assertEquals(listOf("A", "B"), result)
++    }
++
++    @Test
++    fun `credits with no performer rows are still used as the folder`() {
++        val result = folderArtists(
++            creditedArtists = listOf("Metallica"),
++            performerTracks = emptyList(),
++            albumSongCount = 11,
++        )
++        assertEquals(listOf("Metallica"), result)
++    }
++
++    @Test
++    fun `a split credit that only one artist performs is not a compilation`() {
++        // The partial-match case: B is credited but performs nothing while A does perform, so the credited
++        // pair is the folder. The other split-credit test gives every credited artist performer rows.
++        val result = folderArtists(
++            creditedArtists = listOf("A", "B"),
++            performerTracks = performers("A" to 5),
++            albumSongCount = 5,
++        )
++        assertEquals(listOf("A", "B"), result)
++    }
++
++    @Test
++    fun `a credited name that only carries a video suffix is not a stranger`() {
++        // The naming pass treats "Metallica - Topic" and "Metallica" as one artist, so the comparison must
++        // too, or every track of a normal album would be filed under Various Artists.
++        val result = folderArtists(
++            creditedArtists = listOf("Metallica - Topic"),
++            performerTracks = performers("Metallica" to 11),
++            albumSongCount = 11,
++        )
++        assertEquals(listOf("Metallica - Topic"), result)
++    }
++
++    @Test
++    fun `a performer name that only carries a video suffix matches the credit`() {
++        val result = folderArtists(
++            creditedArtists = listOf("Metallica"),
++            performerTracks = performers("Metallica - Topic" to 11),
++            albumSongCount = 11,
++        )
++        assertEquals(listOf("Metallica"), result)
++    }
++
++    @Test
++    fun `a credit that performs nothing wins even with a single performer`() {
++        val result = folderArtists(
++            creditedArtists = listOf("Hans Zimmer"),
++            performerTracks = performers("Prague Philharmonic" to 12),
++            albumSongCount = 12,
++        )
++        assertEquals(listOf(VARIOUS_ARTISTS), result)
++    }
++
++    @Test
++    fun `six performers on six songs are a compilation`() {
++        val result = folderArtists(
++            creditedArtists = emptyList(),
++            performerTracks = performers("A" to 1, "B" to 1, "C" to 1, "D" to 1, "E" to 1, "F" to 1),
++            albumSongCount = 6,
++        )
++        assertEquals(listOf(VARIOUS_ARTISTS), result)
++    }
++
++    @Test
++    fun `a guest on one track does not make a compilation`() {
++        val result = folderArtists(
++            creditedArtists = emptyList(),
++            performerTracks = performers("Metallica" to 10, "The Guest" to 1),
++            albumSongCount = 11,
++        )
++        assertNull(result)
++    }
++
++    @Test
++    fun `a top performer on exactly half is not a compilation`() {
++        val result = folderArtists(
++            creditedArtists = emptyList(),
++            performerTracks = performers("A" to 2, "B" to 2),
++            albumSongCount = 4,
++        )
++        assertNull(result)
++    }
++
++    @Test
++    fun `a track with no performer still counts in the album size`() {
++        // Six of the album's eleven songs carry no artist row, so the top known performer owns five of the
++        // six songs that have artist data, but only five of the eleven stored songs: 5 * 2 < 11, so the
++        // album is filed as a compilation. Pinned deliberately - the denominator is the stored track list,
++        // not the tracks that happen to have artist data (see the fork README's known limitations).
++        val result = folderArtists(
++            creditedArtists = emptyList(),
++            performerTracks = performers("A" to 5, "B" to 1),
++            albumSongCount = 11,
++        )
++        assertEquals(listOf(VARIOUS_ARTISTS), result)
++    }
++
++    @Test
++    fun `a single performer with no credit is not a compilation`() {
++        val result = folderArtists(
++            creditedArtists = emptyList(),
++            performerTracks = performers("Metallica" to 5),
++            albumSongCount = 5,
++        )
++        assertNull(result)
++    }
++
++    @Test
++    fun `no credits and no performers means no folder artist`() {
++        assertNull(folderArtists(emptyList(), emptyList(), 0))
++    }
++
++    @Test
++    fun `duplicate performer rows are summed before the spread test`() {
++        // Two rows for one artist, two tracks each. Summed, the top performer owns four of five songs
++        // (4 * 2 < 5 is false, so it is not a compilation). Read one row at a time it would look like two
++        // songs of five (2 * 2 < 5 is true) and the album would be mislabelled.
++        val result = folderArtists(
++            creditedArtists = emptyList(),
++            performerTracks = performers("A" to 2, "A" to 2, "B" to 1),
++            albumSongCount = 5,
++        )
++        assertNull(result)
++    }
++
++    @Test
++    fun `names are compared trimmed and case-folded`() {
++        val result = folderArtists(
++            creditedArtists = listOf("  Metallica  "),
++            performerTracks = performers("metallica" to 11),
++            albumSongCount = 11,
++        )
++        assertEquals(listOf("Metallica"), result)
++    }
++}
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/DownloadFormatTest.kt b/app/src/test/kotlin/com/music/vivi/playback/DownloadFormatTest.kt
 new file mode 100644
-index 00000000..54a3aa27
+index 00000000..3da43543
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/DownloadFormatTest.kt
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,755 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1583,6 +2018,7 @@ index 00000000..54a3aa27
 +        albumYear: Int? = null,
 +        bitrate: Int? = 256_000,
 +        trackNumber: Int? = null,
++        folderArtists: List<String>? = null,
 +    ) = DownloadFormat.Input(
 +        songId = songId,
 +        title = title,
@@ -1593,6 +2029,7 @@ index 00000000..54a3aa27
 +        albumYear = albumYear,
 +        bitrate = bitrate,
 +        trackNumber = trackNumber,
++        folderArtists = folderArtists,
 +    )
 +
 +    @Test
@@ -2245,5 +2682,69 @@ index 00000000..54a3aa27
 +        assertTrue(name.contains("..."))
 +        assertTrue(name.endsWith("zzz.m4a"))
 +        assertTrue(name.toByteArray(Charsets.UTF_8).size <= DownloadFormat.MAX_FILE_NAME_BYTES)
++    }
++
++    @Test
++    fun `the folder template is filed under the album artist`() {
++        val folders = DownloadFormat.expand(
++            input(folderArtists = listOf("Various Artists")),
++            "%artist%/%album%",
++        )
++        assertEquals(listOf("Various Artists", "Master Of Puppets"), folders)
++    }
++
++    @Test
++    fun `the file name keeps the track artist when the folder uses the album artist`() {
++        val compilation = input(artists = listOf("HYOLYN"), folderArtists = listOf("Various Artists"))
++        assertEquals(
++            "HYOLYN - Master Of Puppets - Enter Sandman",
++            DownloadFormat.fileNameBase(compilation, "%artist% - %album% - %title%"),
++        )
++    }
++
++    @Test
++    fun `an absent, empty or blank album artist falls back to the track artist`() {
++        val expected = listOf("Metallica", "Master Of Puppets")
++        assertEquals(expected, DownloadFormat.expand(input(folderArtists = null), "%artist%/%album%"))
++        assertEquals(expected, DownloadFormat.expand(input(folderArtists = emptyList()), "%artist%/%album%"))
++        assertEquals(expected, DownloadFormat.expand(input(folderArtists = listOf("  ")), "%artist%/%album%"))
++        // The other half of the contract: a present-but-blank album artist still falls through to the track
++        // artists, and when those are blank too the folder ends at the placeholder rather than vanishing.
++        assertEquals(
++            listOf("Unknown Artist"),
++            DownloadFormat.expand(input(artists = emptyList(), folderArtists = listOf("  ")), "%artist%"),
++        )
++    }
++
++    @Test
++    fun `an album artist that sanitises away drops the segment like any other`() {
++        assertEquals(
++            emptyList<String>(),
++            DownloadFormat.expand(input(folderArtists = listOf("..")), "%artist%"),
++        )
++    }
++
++    @Test
++    fun `the tidy pass applies to the album artist too`() {
++        val cleaned = input(folderArtists = listOf("Various Artists", "Metallica - Topic")).cleaned()
++        assertEquals(listOf("Various Artists", "Metallica"), cleaned.folderArtists)
++    }
++
++    @Test
++    fun `an album artist cannot escape the root`() {
++        assertEquals(
++            listOf(".._.._etc"),
++            DownloadFormat.expand(input(folderArtists = listOf("../../etc")), "%artist%"),
++        )
++    }
++
++    @Test
++    fun `usesArtistToken finds the token whatever its case`() {
++        assertTrue(DownloadFormat.usesArtistToken("%artist%/%album%"))
++        assertTrue(DownloadFormat.usesArtistToken("%Album%/%ARTIST%"))
++        assertTrue(DownloadFormat.usesArtistToken("%artist%"))
++        assertFalse(DownloadFormat.usesArtistToken("%album%/%year%"))
++        assertFalse(DownloadFormat.usesArtistToken(""))
++        assertFalse(DownloadFormat.usesArtistToken("plain folder"))
 +    }
 +}

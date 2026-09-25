@@ -61,7 +61,7 @@ already patch hooks; everything else is created by patch 01.
 | Compilation rule, credited case (**Rule A**) | The album has credited artists, at least one performer row exists, and **no** credited artist performs any of the album's tracks | Locale-independent, so the localised "Various Artists" text never has to be matched. Using name comparison instead of the pseudo-artist's missing link needs no new column. |
 | Compilation rule, uncredited case (**Rule B**) | No credited artists, at least two performers, and the top performer is on **under half** the album's tracks (`top * 2 < albumSongCount`) | Catches a compilation whose album header was never stored, without mistaking an album that has a single guest verse for a compilation. |
 | Credit mismatch with no performer rows | Not a compilation | Otherwise an album whose tracks have no artist rows would be "vacuously" credited to a stranger and mislabelled. |
-| Name comparison | Trimmed, case-insensitive | The schema can hold two `artist` rows with the same name and different ids (the generated-local-id path), and a credited name and a performer name that differ only in case are the same artist. |
+| Name comparison | Trimmed, case-folded, and tidied like a name | The schema can hold two `artist` rows with the same name and different ids (the generated-local-id path), and a credited name and a performer name that differ only in case are the same artist. Tidying the same way the naming rules do also makes a credited name that only carries a video suffix (`Metallica - Topic`) the same artist as the performer, so a normal album is not filed under `Various Artists`. |
 | Result value | The credited names joined with `", "`, in display order, de-duplicated | Matches the existing multi-artist joining rule for track artists, so a split album credited to two artists becomes one folder instead of two. |
 | Compilation folder name | The fixed ASCII constant `Various Artists` | Consistent with the existing `Unknown Artist` / `Unknown Album` decision that placeholders are never localised, so an English and a German install produce the same tree. |
 | Opt-out | None; always on | A folder organiser is expected to file an album under its album artist, and a switch would double the branches and the tests for a case nobody has asked for. |
@@ -88,7 +88,7 @@ already patch hooks; everything else is created by patch 01.
 | --- | --- |
 | **NEW** `app/src/main/kotlin/com/music/vivi/playback/AlbumArtist.kt` | `const val VARIOUS_ARTISTS = "Various Artists"`, the `AlbumPerformerTracks(artist, tracks)` Room projection, and the pure rule `folderArtists(creditedArtists, performerTracks, albumSongCount): List<String>?`, where `null` means "fall back to the track artists". No Android imports, so it runs as a JVM unit test and stays inside the coverage gate. |
 | `app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt` | `Input` gains `folderArtists: List<String>? = null`. `cleaned()` tidies it exactly like `artists`. The folder branch of `resolve("artist", ...)` becomes `input.folderArtists ?: input.artists`, where an empty or all-blank list counts as absent; the file-name branch is unchanged. New `internal usesArtistToken(template): Boolean`, matching the existing `internal resolvedSegments`, so the exporter can tell whether the lookups are needed without duplicating the token regex. |
-| `app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt` | One new private `suspend fun resolveFolderArtists(song, folderTemplate): List<String>?` and one call from `exportLocked` when `Input` is built. The three writers, the SAF walk, the MediaStore publish flow and `copyFromCache` are untouched. |
+| `app/src/main/kotlin/com/music/vivi/playback/DownloadFolderExporter.kt` | One new top-level `internal suspend fun albumFolderArtists(database: MusicDatabase, albumId: String?): List<String>?`, guarded at the call site by `DownloadFormat.usesArtistToken` and called from `exportLocked` when `Input` is built; it is shared with the settings preview, which is why it is not private. The three writers, the SAF walk, the MediaStore publish flow and `copyFromCache` are untouched. |
 | `app/src/main/kotlin/com/music/vivi/db/DatabaseDao.kt` | Three `suspend` queries: `albumCreditedArtists(albumId)`, `albumPerformerTracks(albumId)` and `albumSongCount(albumId)`. Added next to the existing `albumIndex` hook. |
 | `app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt` | The folder dialog's preview resolves the same artist value for its sample song, so the preview shows the path that will actually be written, plus one informational line about what `%artist%` resolves to. |
 | `app/src/main/res/values/local_download_strings.xml` | One string for that line. |
@@ -133,10 +133,10 @@ Worked examples, all of them covered by tests:
 Export stays on its existing path:
 
 `STATE_COMPLETED` -> `DownloadFolderExporter.export(songId)` -> `exportMutex` -> song and format from the
-database -> `resolveFolderArtists` when the folder template uses `%artist%` -> `DownloadFormat.Input` ->
+database -> `albumFolderArtists` when the folder template uses `%artist%` -> `DownloadFormat.Input` ->
 `DownloadFormat.expand` / `fileName` -> the three writers.
 
-`resolveFolderArtists` in the exporter:
+`albumFolderArtists` and its call site in the exporter:
 
 - returns `null` without touching the database when the folder template has no `%artist%` token;
 - returns `null` when the song has no album id;

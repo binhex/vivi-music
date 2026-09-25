@@ -95,7 +95,7 @@ matching the exact snippets in this plan, by review, and by the CI gates above. 
 
 ```bash
 rm -rf /tmp/vivi-album-artist
-git clone --local /data/forks/vivi-music /tmp/vivi-album-artist
+git clone --no-hardlinks /data/forks/vivi-music /tmp/vivi-album-artist
 cd /tmp/vivi-album-artist
 git checkout -b local/album-artist
 ./local-patches/apply.sh
@@ -226,13 +226,13 @@ INSERT INTO song_artist_map VALUES
   ('s4', 'ar4', 0), ('s5', 'ar5', 0), ('s6', 'ar6', 0);
 """
 
-QUERY_BLOCK = re.compile(r'@Query\(\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+)\)', re.S)
+QUERY_BLOCK = re.compile(r'@Query\(\s*((?:"(?:[^"\\]|\\.)*"\s*\+?\s*)+),?\s*\)', re.S)
 LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 source = open(DAO).read()
 queries = ["".join(LITERAL.findall(block)) for block in QUERY_BLOCK.findall(source)]
-credited = [q for q in queries if "album_artist_map" in q]
-performers = [q for q in queries if "song_artist_map" in q and "GROUP BY artist.id" in q]
+credited = [q for q in queries if q.startswith("SELECT artist.name FROM album_artist_map")]
+performers = [q for q in queries if q.startswith("SELECT artist.name AS artist, COUNT(DISTINCT song_album_map.songId)")]
 counts = [q for q in queries if q.startswith("SELECT COUNT(DISTINCT songId) FROM song_album_map")]
 
 assert len(credited) == 1, f"expected 1 credited-artists query, found {len(credited)}"
@@ -1072,7 +1072,7 @@ In `app/src/main/res/values/local_download_strings.xml`, add this line directly 
 before `</resources>`:
 
 ```xml
-    <string name="download_folder_artist_note">%artist% is the album artist; compilations use Various Artists.</string>
+    <string name="download_folder_artist_note">%1$s is the album artist; compilations use Various Artists.</string>
 ```
 
 - [ ] **Step 2: Check the XML is still well formed**
@@ -1257,7 +1257,10 @@ Replace with:
             )
             if (!editingFile) {
                 Text(
-                    text = stringResource(R.string.download_folder_artist_note),
+                    text = stringResource(
+                        R.string.download_folder_artist_note,
+                        DownloadFormat.ARTIST_TOKEN,
+                    ),
                     modifier = Modifier.padding(top = 8.dp),
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -1419,15 +1422,16 @@ continuing.
 
 ```bash
 rm -rf /tmp/vivi-album-artist-verify
-git clone --local /data/forks/vivi-music /tmp/vivi-album-artist-verify
+git clone --no-hardlinks /data/forks/vivi-music /tmp/vivi-album-artist-verify
 cd /tmp/vivi-album-artist-verify && ./local-patches/apply.sh
 /tmp/ktool/run-album-artist-tests.sh /tmp/vivi-album-artist-verify
 python3 /tmp/ktool/check-album-artist-sql.py \
   /tmp/vivi-album-artist-verify/app/src/main/kotlin/com/music/vivi/db/DatabaseDao.kt
 ```
 
-Expected: the patch applies, `OK (<baseline> + 21 tests)`, full coverage on both gated classes, and `SQL OK`. This proves the
-committed patch is complete on its own - a fresh upstream tree plus the patch reproduces everything.
+Expected: the patch applies, `OK (<baseline> + 21 tests)`, full coverage on both gated classes, and
+`SQL OK`. This proves the committed patch is complete on its own - a fresh upstream tree plus the patch
+reproduces everything.
 
 - [ ] **Step 5: Update `local-patches/README.md`**
 
@@ -1487,7 +1491,7 @@ this task.
 cd /data/forks/vivi-music
 ./local-patches/apply.sh --check
 rm -rf /tmp/vivi-album-artist-final
-git clone --local /data/forks/vivi-music /tmp/vivi-album-artist-final
+git clone --no-hardlinks /data/forks/vivi-music /tmp/vivi-album-artist-final
 cd /tmp/vivi-album-artist-final && ./local-patches/apply.sh
 /tmp/ktool/run-album-artist-tests.sh /tmp/vivi-album-artist-final
 python3 /tmp/ktool/check-album-artist-sql.py \
