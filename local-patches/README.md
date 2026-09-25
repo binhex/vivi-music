@@ -52,6 +52,24 @@ in a file manager or any other music player:
   default. Track numbers come from the album position already stored in `song_album_map` (two digits up to
   99, raw above), so a download taken from a search or playlist, which has no album row, simply carries no
   number.
+- **Download recovery** for the "download sits there forever" case: a patch-owned watchdog reads the
+  download index every 15 seconds and, for a download that has made no progress for 90 seconds - or that has
+  been running for 5 minutes even while slowly crawling - restarts it, and retries a failed download once
+  per session, only when the failure is younger than 10 minutes and happened while the watchdog was watching
+  (a failed row outlives the app, so those two bounds together stop a dead download being re-queued and
+  re-notified on every launch, and a row that Media3 rebuilds never refills that one retry).
+  A restart keeps the bytes already cached (Media3 re-queues the download and the cache serves the finished
+  prefix), and it re-adds the request rather than setting a stop reason, so the download never passes through
+  the stopped state that would make the app forget it was downloaded.
+  Each check reads only the watching rows - queued, downloading and failed - a download missing from a check
+  is forgotten, and a row that Media3 re-creates gives the restart budget back (the retry budget only when
+  the rebuild is the watchdog's own retry, so a re-download by the user is never refused a retry); before
+acting, the row is read again so a download the user deleted cannot be brought back to life. Nothing at all is touched
+    while the device is offline - a
+  network that reports internet access but never validates (a captive portal) counts as offline - queued or
+  stopped downloads are never restarted, restarts are capped at two per download, each check runs on the
+  thread Media3 requires the manager to be used from, and every recovery is logged under the
+  `DownloadWatchdog` tag.
 - Optional **clean up names** switch (on by default) inside the File format dialog: a trailing bracket tag
   from a fixed list (`(Official Video)`, `[HD]`, `(Official Audio)`, `[4K]`, ...) and a trailing `- Topic`
   artist suffix are removed before either template is expanded. `(Remastered)`, `(Live)` and `(feat. ...)`
@@ -59,12 +77,15 @@ in a file manager or any other music player:
 - The private Media3 download cache is never modified, so an export failure cannot break offline
   playback: the copy is read from the cache and only the new file is touched.
 
-Footprint: 9 new files, plus **58 added lines** in four upstream files -
+Footprint: 12 new files, plus **80 added lines** in four upstream files -
 `DownloadUtil.kt` (constructor parameter + one call in the `STATE_COMPLETED` branch),
 `StorageSettings.kt` (one call to `LocalDownloadSettingsGroup()`),
 `app/build.gradle.kts` (Kover wiring, the `AlbumArtist*` coverage scope and `testImplementation(libs.junit)`)
 and `DatabaseDao.kt` (a suspend query for the album position plus three for the album's credited artists
-and performer spread).
+and performer spread). The watchdog's share of that is small and reversible: one constructor parameter, one
+`start` call, and closing the index cursor the same `init` block used to leak, plus the one Kover filter line
+for its pure unit - so removing the feature again means deleting the patch's own files and reverting those
+few lines.
 
 ## Known limitations (accepted for now)
 
@@ -79,6 +100,10 @@ and performer spread).
 | A credit that performs nothing becomes `Various Artists` | An album credited to a composer, a label or a compilation pseudo-artist rather than to its performers is filed under `Various Artists`. That credit is deliberately discarded: it is not a name the album's files belong under, and matching the localised text of the pseudo-artist instead would make the folder tree depend on the app language. |
 | A two-track release by two artists is not detected | The performer-spread rule needs the top performer to own *under* half of the album, and on a two-track release one performer owns exactly half, so such an album is not treated as a compilation and each track keeps its own artist folder - the split this patch removes for larger compilations. The credited-artist rule still catches it whenever the album header was stored. |
 | Rule B divides by the stored track list, not by the tracks that have artist data | `albumSongCount` counts every song the album has stored, including tracks whose metadata lists no artist. An album where the top known performer owns most of the tracks *with* artist data can therefore still be filed under `Various Artists`. The credited-artist rule (Rule A) is unaffected. |
+| A restarted download reuses its cached stream URL until that URL expires | The watchdog can interrupt a stalled transfer and re-queue it, but it cannot force a fresh URL: while the cached URL is still inside its lifetime the restart reuses it. A URL that fails before its stated expiry is only replaced once Media3 itself marks the download failed and clears the cache entry, and a URL that hangs rather than erroring spends both restart budgets and is then left alone. Forcing a fresh URL would mean changing the stream resolver, which is upstream code, so it stays out of the patch. |
+| A delete landing at the same instant as a recovery can still be undone | Before acting, the watchdog re-reads the row and skips a download that has gone or moved on, which narrows the window to the gap between that read and Media3 processing the re-added request on its own thread. Closing it completely would need an atomic compare-and-set that Media3 does not offer. |
+| A recovery runs without the download service | The manager is called directly, because `DownloadService.sendAddDownload` starts the service with `startService`, which Android forbids from the background - and a stalled download is usually found there. A recovery started while the app is in the background therefore runs without the service holding the process, so the OS may park it until the app is next opened; the request keeps its identity and its cached bytes and carries on then. |
+| The watchdog's timings are fixed defaults | 90 seconds without progress, 5 minutes total, two restarts, one retry per session for a failure younger than 10 minutes that happened while the watchdog was watching, checked every 15 seconds. Telling the watchdog's own retry apart from a user's re-download by timing does not work (a frozen process notices either one late), so the retry is simply per session, and they are constants in the patch rather than settings - a device with an unusually slow connection will see the restarts harmlessly, because the download resumes from its cached prefix. |
 | Rule A compares names, so a different script or romanisation can misfile an album | Only whitespace, case, a trailing `- Topic` and a closed bracket-tag list are unified. A credit stored in a different script or romanisation from the performer (a native-script credit against romanised track rows, for example) therefore looks like "the credit performs none of the album" and the album is filed under `Various Artists`. The design deliberately trades that failure class for language independence. |
 | Windows-reserved names are not rewritten | `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` and `LPT1`-`LPT9` pass the sanitiser. Harmless on Android, but a tree copied to Windows or written to FAT/OTG media can be awkward to open. |
 | The SAF folder is treated as Vivi's own export folder | SAF has no ownership column (unlike MediaStore's `OWNER_PACKAGE_NAME`), so an existing file with the same name is replaced. Point the feature at a dedicated folder if it already holds files from other tools. |
@@ -100,14 +125,18 @@ and performer spread).
 `Local Patch Build` enforces a Kover line-coverage gate of 95% over the JVM-testable scope. The filter
 is explicit in `app/build.gradle.kts`:
 
-- **Measured:** `DownloadFormat` (the pure token, path and naming rules) and `AlbumArtist` (the pure
-  album-artist rule) - a local JaCoCo run over the full unit suite reports 137/137 and 15/15 lines =
-  **100%**; CI enforces the 95% bound with the Kover `includes` filters
-  `com.music.vivi.playback.DownloadFormat*` and `com.music.vivi.playback.AlbumArtist*`.
+- **Measured:** `DownloadFormat` (the pure token, path and naming rules), `AlbumArtist` (the pure
+  album-artist rule) and `DownloadRecovery` (the pure stall/retry policy behind the watchdog) - a local
+  JaCoCo run over the full unit suite reports 137/137 (`DownloadFormat`), 15/15 (`AlbumArtistKt`) and 83/83
+  across every `DownloadRecovery*` class = 106/106 lines = **100%**; CI enforces the 95% bound with the Kover `includes`
+  filters
+  `com.music.vivi.playback.DownloadFormat*`, `com.music.vivi.playback.AlbumArtist*` and
+  `com.music.vivi.playback.DownloadRecovery*` - the last one covering the policy, its observation and its
+  action/phase enums, because they all share that prefix.
 - **Excluded from the measured scope, because they need Robolectric or a device:** `DownloadFolderExporter`,
-  `SafFolders`, `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`. The gate's `includes` filter
-  limits measurement to `DownloadFormat*` and `AlbumArtist*`, so these are named debt here rather than
-  listed in the build file.
+`SafFolders`, `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`, `DownloadWatchdog`. The gate's
+  `includes` filter limits measurement to `DownloadFormat*`, `AlbumArtist*` and `DownloadRecovery*`, so these
+  are named debt here rather than listed in the build file.
 - **Not measured at all (named debt):** the `canvas`, `innertube` and `lyricsProvider` modules. Wiring
   Kover into them means build-file contact in modules this patch never touches, and a 95% bound there
   would likely fail on pre-existing coverage. Agreed with the maintainer to record it as debt.

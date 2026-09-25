@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index cd1b6155..b06360fe 100644
+index cd1b6155..1ac06243 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -14,6 +14,7 @@ plugins {
@@ -36,25 +36,28 @@ index cd1b6155..b06360fe 100644
  
      implementation(libs.activity)
      implementation(libs.hilt.navigation)
-@@ -317,3 +319,28 @@ dependencies {
+@@ -317,3 +319,31 @@ dependencies {
      implementation(libs.androidx.core.splashscreen)
  }
  
 +// Coverage gate for the JVM-testable code. The scope is the pure rules - the folder and file-name
-+// templates and the album-artist rule: the rest of this patch depends on Android, Hilt, Media3 or Compose
-+// and would need Robolectric or a device. That excluded debt is recorded in the fork README, not here.
++// templates, the album-artist rule and the download stall/retry policy: the rest of this patch depends on
++// Android, Hilt, Media3 or Compose and would need Robolectric or a device. That excluded debt is recorded in
++// the fork README, not here.
 +kover {
 +    reports {
 +        filters {
 +            includes {
 +                classes("com.music.vivi.playback.DownloadFormat*")
 +                classes("com.music.vivi.playback.AlbumArtist*")
++                classes("com.music.vivi.playback.DownloadRecovery*")
 +            }
 +            excludes {
 +                // The wildcard above also matches the test class; test code is fully covered and must not
 +                // pad the number the gate measures.
 +                classes("com.music.vivi.playback.DownloadFormatTest")
 +                classes("com.music.vivi.playback.AlbumArtistTest")
++                classes("com.music.vivi.playback.DownloadRecoveryTest")
 +            }
 +        }
 +        verify {
@@ -1085,19 +1088,286 @@ index 00000000..fdbb9cf5
 +        }
 +    }
 +}
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
+new file mode 100644
+index 00000000..10fcadf6
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
+@@ -0,0 +1,260 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++/** How often the watchdog looks at the download index. */
++internal const val DOWNLOAD_WATCH_INTERVAL_MS = 15_000L
++
++/** How long a download may make no progress at all before it is restarted. */
++internal const val DOWNLOAD_STALL_TIMEOUT_MS = 90_000L
++
++/** How long a download may run in total before it is restarted even if it is slowly progressing. */
++internal const val DOWNLOAD_SLOW_TRANSFER_TIMEOUT_MS = 5 * 60 * 1_000L
++
++/** How many restarts one download gets before the watchdog leaves it alone. */
++internal const val DOWNLOAD_MAX_RESTARTS = 2
++
++/** How many automatic retries a failed download gets. */
++internal const val DOWNLOAD_MAX_RETRIES = 1
++
++/** How old a failure may be and still be retried; a row outlives the process, so this bounds every launch. */
++internal const val DOWNLOAD_RETRY_WINDOW_MS = 10 * 60 * 1_000L
++
++
++/** What the watchdog should do about a download, if anything. */
++internal enum class DownloadRecoveryAction { NONE, RESTART, RETRY }
++
++/** The download states this policy cares about, free of Media3 types so the policy stays a pure unit. */
++internal enum class DownloadRecoveryPhase { QUEUED, DOWNLOADING, COMPLETED, FAILED, STOPPED, REMOVING, RESTARTING, OTHER }
++
++/** One download as the watchdog last saw it. */
++internal data class DownloadRecoveryObservation(
++    val id: String,
++    val phase: DownloadRecoveryPhase,
++    val bytesDownloaded: Long,
++    /** False when the device has no usable network, which suspends every recovery decision. */
++    val online: Boolean = true,
++    /**
++     * How long ago the failure happened, already measured on the wall clock by the adapter, or null when
++     * unknown. An age rather than a timestamp on purpose: Media3's row timestamps come from
++     * `System.currentTimeMillis()` while this policy's clock is monotonic, so comparing the two directly
++     * would silently disable the retry window.
++     */
++    val failureAgeMs: Long? = null,
++    /**
++     * False when the failure happened before this process started watching, which is the only way a retry
++     * budget that lives in memory can be spent across launches: every new failure refreshes the row's
++     * timestamp, so the age alone would let a download that keeps failing be re-queued once per launch.
++     */
++    val failureIsFromThisSession: Boolean = true,
++    /**
++     * Media3's start time for this row. A different value means the row was re-created - the user removed and
++     * re-downloaded, or a merge rebuilt it as a new download - which is a new attempt as far as the restart
++     * budget goes; the retry budget is per session and survives it.
++     */
++    val rowStartedAtMs: Long? = null,
++)
++
++// Media3's public Download.STATE_* numbers, restated here so this file needs no Media3 import.
++private const val MEDIA3_STATE_QUEUED = 0
++private const val MEDIA3_STATE_STOPPED = 1
++private const val MEDIA3_STATE_DOWNLOADING = 2
++private const val MEDIA3_STATE_COMPLETED = 3
++private const val MEDIA3_STATE_FAILED = 4
++private const val MEDIA3_STATE_REMOVING = 5
++private const val MEDIA3_STATE_RESTARTING = 7
++
++/**
++ * Maps a Media3 `Download.STATE_*` number onto [DownloadRecoveryPhase].
++ *
++ * The mapping lives here rather than in the Android-side watchdog so that the watchdog has no branching
++ * of its own and every state - including the unused 6 and any future value - is pinned by a unit test
++ * instead of being guessed at on a device.
++ */
++internal fun downloadPhaseOf(state: Int): DownloadRecoveryPhase = when (state) {
++    MEDIA3_STATE_QUEUED -> DownloadRecoveryPhase.QUEUED
++    MEDIA3_STATE_STOPPED -> DownloadRecoveryPhase.STOPPED
++    MEDIA3_STATE_DOWNLOADING -> DownloadRecoveryPhase.DOWNLOADING
++    MEDIA3_STATE_COMPLETED -> DownloadRecoveryPhase.COMPLETED
++    MEDIA3_STATE_FAILED -> DownloadRecoveryPhase.FAILED
++    MEDIA3_STATE_REMOVING -> DownloadRecoveryPhase.REMOVING
++    MEDIA3_STATE_RESTARTING -> DownloadRecoveryPhase.RESTARTING
++    else -> DownloadRecoveryPhase.OTHER
++}
++
++/**
++ * Decides when a download that is making no progress - or crawling - should be restarted, and when a
++ * failed download should be retried, so that a stalled or crawling download is recovered instead of sitting
++ * in a downloading state unnoticed. Its actions are bounded (see below), so it shortens a stall rather than
++ * promising to eliminate one.
++ *
++ * Why this exists: Media3's `DownloadManager` retries a failing download, but its retry counter resets
++ * whenever any bytes arrive, and neither it nor the app has a wall-clock deadline. A transfer that
++ * trickles, or that keeps expiring its stream URL, therefore cycles inside `STATE_DOWNLOADING` for
++ * minutes while the UI shows a spinner and the listener reports nothing (Media3 does not deliver
++ * progress to listeners). This policy is the missing deadline.
++ *
++ * The rules, all of them bounded:
++ *
++ * - A download that makes no progress for [stallTimeoutMs] is restarted.
++ * - A download that is still running after [slowTransferTimeoutMs], even while progressing slowly, is
++ *   restarted too - a crawling transfer is what a stalled one looks like from the outside.
++ * - A failed download is retried [maxRetriesPerDownload] time(s).
++ * - Queued, stopped and restarting downloads are never touched: they can be legitimately waiting for
++ *   the network, for `maxParallelDownloads`, or for a service restart.
++ * - Nothing at all happens while the device is offline, so recovery never churns without a network.
++ * - Restarts are capped by [maxRestartsPerDownload], so a genuinely broken file is left alone instead
++ *   of looping forever.
++ * - A failure is only retried while it is younger than [retryWindowMs] **and** happened while this watch was
++ *   running, so a download that keeps failing is not re-queued (and re-notified) on every app launch - its
++ *   in-memory retry budget would otherwise be refilled by every launch.
++ * - [endPass] forgets any download that disappeared from the index, and a re-created row (a different
++ *   `startTimeMs`) resets the restart budget, so a re-download is never held back by a spent budget - while
++ *   the retry budget survives, because the watchdog's own retry also re-creates the row.
++ *
++ * A restart preserves the bytes already in the download cache (Media3 re-queues the download and the
++ * cache serves the finished prefix), so none of these actions loses work.
++ */
++internal class DownloadRecoveryPolicy(
++    private val stallTimeoutMs: Long = DOWNLOAD_STALL_TIMEOUT_MS,
++    private val slowTransferTimeoutMs: Long = DOWNLOAD_SLOW_TRANSFER_TIMEOUT_MS,
++    private val maxRestartsPerDownload: Int = DOWNLOAD_MAX_RESTARTS,
++    private val maxRetriesPerDownload: Int = DOWNLOAD_MAX_RETRIES,
++    private val retryWindowMs: Long = DOWNLOAD_RETRY_WINDOW_MS,
++) {
++    init {
++        // A zero or negative budget would silently stop the policy acting while still spending its clocks,
++        // which looks exactly like a download that has not stalled yet. Fail loudly instead.
++        require(stallTimeoutMs > 0) { "stallTimeoutMs must be positive" }
++        require(slowTransferTimeoutMs > 0) { "slowTransferTimeoutMs must be positive" }
++        require(maxRestartsPerDownload > 0) { "maxRestartsPerDownload must be positive" }
++        require(maxRetriesPerDownload > 0) { "maxRetriesPerDownload must be positive" }
++        require(retryWindowMs > 0) { "retryWindowMs must be positive" }
++    }
++    private class Watch(
++        var bytes: Long,
++        var lastProgressAtMs: Long,
++        var downloadingSinceMs: Long?,
++        var startedAtMs: Long?,
++        var restarts: Int = 0,
++        var retries: Int = 0,
++    )
++
++    private val watches = mutableMapOf<String, Watch>()
++
++    /**
++     * Feeds one observation in and returns what to do about it. [nowMs] is the watchdog's own clock, so
++     * the decisions do not depend on timestamps inside Media3.
++     */
++    fun onObservation(observation: DownloadRecoveryObservation, nowMs: Long): DownloadRecoveryAction {
++        val watch = watches.getOrPut(observation.id) {
++            Watch(observation.bytesDownloaded, nowMs, downloadingSinceMs = null, startedAtMs = null)
++        }
++        val rowStartedAtMs = observation.rowStartedAtMs
++        if (rowStartedAtMs != null && watch.startedAtMs != null && rowStartedAtMs != watch.startedAtMs) {
++            // The row was re-created, so this is a new attempt: give the restart budget back and re-baseline
++            // the clocks. The retry budget deliberately survives every rebuild - the watchdog's own retry
++            // rebuilds the row too, and telling the two apart by timing cannot work: a frozen process notices
++            // the rebuild minutes later and would read its own retry as a new attempt. One automatic retry per
++            // download per session is the predictable rule; a user who re-downloads sees a visible failure and
++            // can retry by hand.
++            watch.restarts = 0
++            watch.downloadingSinceMs = null
++            watch.lastProgressAtMs = nowMs
++            watch.bytes = observation.bytesDownloaded
++        }
++        if (rowStartedAtMs != null) {
++            watch.startedAtMs = rowStartedAtMs
++        }
++        if (!observation.online) {
++            // Offline time is not the download's fault. Re-baseline every clock so the outage is never
++            // charged to the stall or crawl budget, and decide nothing while there is no network - Media3
++            // parks the download in QUEUED and resumes it when connectivity returns.
++            watch.downloadingSinceMs = null
++            watch.lastProgressAtMs = nowMs
++            watch.bytes = observation.bytesDownloaded
++            return DownloadRecoveryAction.NONE
++        }
++        return when (observation.phase) {
++            DownloadRecoveryPhase.DOWNLOADING -> onDownloading(watch, observation, nowMs)
++            DownloadRecoveryPhase.FAILED -> onFailed(watch, observation, nowMs)
++            // Not downloading, so it cannot be stalled; the clock starts again when it resumes. A finished or
++            // removed download never reaches here from the adapter - its row leaves the read set and [endPass]
++            // forgets it - but a caller feeding those phases gets the same "do nothing" answer.
++            else -> {
++                watch.downloadingSinceMs = null
++                DownloadRecoveryAction.NONE
++            }
++        }
++    }
++
++    private fun onDownloading(watch: Watch, observation: DownloadRecoveryObservation, nowMs: Long): DownloadRecoveryAction {
++        val startedAt = watch.downloadingSinceMs
++        if (startedAt == null) {
++            // First sight of this attempt: take a baseline rather than judging it against a stale one.
++            watch.downloadingSinceMs = nowMs
++            watch.lastProgressAtMs = nowMs
++            watch.bytes = observation.bytesDownloaded
++            return DownloadRecoveryAction.NONE
++        }
++        if (observation.bytesDownloaded != watch.bytes) {
++            // Any change counts as progress, including bytes going backwards after a restart.
++            watch.bytes = observation.bytesDownloaded
++            watch.lastProgressAtMs = nowMs
++        }
++        val stalled = nowMs - watch.lastProgressAtMs >= stallTimeoutMs
++        val tooSlow = nowMs - startedAt >= slowTransferTimeoutMs
++        if (!stalled && !tooSlow) return DownloadRecoveryAction.NONE
++        if (watch.restarts >= maxRestartsPerDownload) return DownloadRecoveryAction.NONE
++        watch.restarts++
++        // The restart begins a new attempt, so re-baseline both clocks for it.
++        watch.downloadingSinceMs = null
++        watch.lastProgressAtMs = nowMs
++        return DownloadRecoveryAction.RESTART
++    }
++
++    private fun onFailed(
++        watch: Watch,
++        observation: DownloadRecoveryObservation,
++        nowMs: Long,
++    ): DownloadRecoveryAction {
++        // A failure that predates this watch belongs to an earlier session: the retry budget died with that
++        // process, so retrying here would re-queue (and re-notify about) the same dead download on every launch.
++        if (!observation.failureIsFromThisSession) return DownloadRecoveryAction.NONE
++        if (watch.retries >= maxRetriesPerDownload) return DownloadRecoveryAction.NONE
++        // A failed row outlives the process, so without this window every launch would re-queue a download
++        // that is permanently dead and notify the user about it again.
++        val failureAgeMs = observation.failureAgeMs
++        if (failureAgeMs != null && failureAgeMs > retryWindowMs) return DownloadRecoveryAction.NONE
++        watch.retries++
++        watch.downloadingSinceMs = null
++        return DownloadRecoveryAction.RETRY
++    }
++
++    /**
++     * Returns the budget a decided action would have spent, for a caller that then found the download had
++     * moved on and did nothing about it. Without this the download would lose a restart, or its single retry,
++     * for an action that never happened.
++     */
++    fun onActionSkipped(id: String) {
++        val watch = watches[id] ?: return
++        if (watch.restarts > 0) watch.restarts--
++        if (watch.retries > 0) watch.retries--
++        watch.downloadingSinceMs = null
++    }
++
++    /**
++     * Drops the bookkeeping of every download that was missing from the pass that just ended.
++     *
++     * A download removed between two passes is never observed as REMOVING (Media3 deletes the row as soon as
++     * the removal finishes), so without this the entry - and its spent restart and retry budgets - would
++     * survive for the life of the process and a later re-download of the same song would inherit them. The
++     * caller must only prune after a successful read of the index, where every surviving row was observed.
++     */
++    fun endPass(observedIds: Set<String>) {
++        watches.keys.retainAll(observedIds)
++    }
++}
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt
-index df48f9bb..d3725f5b 100644
+index df48f9bb..73fd11c0 100644
 --- a/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadUtil.kt
-@@ -68,6 +68,7 @@ constructor(
+@@ -68,6 +68,8 @@ constructor(
      val databaseProvider: DatabaseProvider,
      @DownloadCache val downloadCache: SimpleCache,
      @PlayerCache val playerCache: SimpleCache,
 +    private val downloadFolderExporter: DownloadFolderExporter,
++    private val downloadWatchdog: DownloadWatchdog,
  ) {
      private val connectivityManager = context.getSystemService<ConnectivityManager>()!!
      private val audioQuality by enumPreference(context, AudioQualityKey, AudioQuality.AUTO)
-@@ -272,6 +273,7 @@ constructor(
+@@ -272,6 +274,7 @@ constructor(
                              when (download.state) {
                                  Download.STATE_COMPLETED -> {
                                      database.updateDownloadedInfo(download.request.id, true, LocalDateTime.now())
@@ -1105,6 +1375,233 @@ index df48f9bb..d3725f5b 100644
                                  }
                                  Download.STATE_FAILED,
                                  Download.STATE_STOPPED,
+@@ -313,11 +316,16 @@ constructor(
+ 
+     init {
+         val result = mutableMapOf<String, Download>()
+-        val cursor = downloadManager.downloadIndex.getDownloads()
+-        while (cursor.moveToNext()) {
+-            result[cursor.download.request.id] = cursor.download
++        downloadManager.downloadIndex.getDownloads().use { cursor ->
++            while (cursor.moveToNext()) {
++                result[cursor.download.request.id] = cursor.download
++            }
+         }
+         downloads.value = result
++        // Recovery for a download that would otherwise sit in DOWNLOADING forever: the watchdog restarts one
++        // that stops making progress and retries one that fails. It lives inside this scope, so cancelling
++        // the scope stops it.
++        downloadWatchdog.start(scope, downloadManager)
+     }
+ 
+     fun getDownload(songId: String): Flow<Download?> = downloads.map { it[songId] }
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadWatchdog.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadWatchdog.kt
+new file mode 100644
+index 00000000..78e6375f
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadWatchdog.kt
+@@ -0,0 +1,201 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import android.content.Context
++import android.net.ConnectivityManager
++import android.net.NetworkCapabilities
++import android.os.SystemClock
++import androidx.core.content.getSystemService
++import androidx.media3.exoplayer.offline.Download
++import androidx.media3.exoplayer.offline.DownloadManager
++import dagger.hilt.android.qualifiers.ApplicationContext
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.isActive
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import timber.log.Timber
++import javax.inject.Inject
++import javax.inject.Singleton
++
++/**
++ * The Android half of the local patch's download recovery: every [DOWNLOAD_WATCH_INTERVAL_MS] it reads
++ * Media3's download index, asks [DownloadRecoveryPolicy] what to do about each download, and applies the
++ * answer. It exists because Media3 has no wall-clock deadline of its own: a download whose transfer crawls
++ * or whose stream URL keeps expiring cycles inside `STATE_DOWNLOADING` for minutes, with no progress
++ * callback and no failure, so the UI shows a spinner that never ends.
++ *
++ * Deliberately thin: every decision lives in [DownloadRecoveryPolicy], which is pure Kotlin and unit
++ * tested, and the Media3 state numbers are mapped by [downloadPhaseOf]. This class only reads, logs and
++ * calls - and each pass runs on the thread that owns the manager (see [start]).
++ *
++ * Readings the loop costs and why that is acceptable: one indexed read per tick, restricted to the queued,
++ * downloading and failed rows - typically a handful, even in a library with thousands of finished downloads.
++ * A download that has just failed leaves the manager's current downloads, so the index is the only place its
++ * `FAILED` row can still be seen; skipping the read when nothing looks active would lose exactly the failure
++ * this is meant to retry.
++ *
++ * Nothing here touches upstream code: the patch adds one constructor parameter and one `start` call, and
++ * closes the index cursor that `DownloadUtil`'s own initialisation used to leak.
++ */
++@Singleton
++class DownloadWatchdog
++@Inject
++constructor(
++    @ApplicationContext private val context: Context,
++) {
++    private val policy = DownloadRecoveryPolicy()
++
++    /**
++     * Starts watching. The loop lives in [scope] so the owner can cancel it - nulling this class out on
++     * its own would leave the loop running with nothing to watch.
++     *
++     * Each pass is dispatched onto `Dispatchers.Main.immediate` because Media3 documents that a
++     * `DownloadManager` instance must only be accessed from the thread that created it, which for this app is
++     * the main thread; every other call site goes through `DownloadService` for the same reason. The pass
++     * itself does one indexed read plus the recoveries it decides on - the same kind of work, on the same
++     * thread, as `DownloadUtil`'s own initialisation, which reads the whole index once for the UI.
++     */
++    fun start(scope: CoroutineScope, downloadManager: DownloadManager) {
++        scope.launch {
++            Timber.tag(TAG).d("Download watchdog started, checking every %d ms", DOWNLOAD_WATCH_INTERVAL_MS)
++            // Failures older than this belong to an earlier process, whose retry budget died with it.
++            val watchingSinceWallMs = System.currentTimeMillis()
++            while (isActive) {
++                delay(DOWNLOAD_WATCH_INTERVAL_MS)
++                try {
++                    withContext(Dispatchers.Main.immediate) { watchOnce(downloadManager, watchingSinceWallMs) }
++                } catch (e: CancellationException) {
++                    throw e
++                } catch (e: Exception) {
++                    // A recovery pass must never take the app down; the next tick tries again.
++                    Timber.tag(TAG).w(e, "Download watch tick failed")
++                }
++            }
++        }
++    }
++
++    private fun watchOnce(downloadManager: DownloadManager, watchingSinceWallMs: Long) {
++        val online = isOnline()
++        // A monotonic clock: an NTP or user clock change must not look like a stall, nor hide one.
++        val now = SystemClock.elapsedRealtime()
++        val observed = mutableSetOf<String>()
++        // Queued rows are read as well as downloading and failed ones, and that is not incidental: a re-added
++        // request parks in QUEUED while Media3 cancels the old task and starts a new one, so a pass that did
++        // not see it would prune the download and hand its spent restart and retry budgets back. Completed and
++        // stopped rows are deliberately left out - a library holds a row per downloaded song and there is
++        // nothing to decide about them - which also keeps the read small.
++        //
++        // The cursor is drained before anything is decided, because acting inside the loop writes to the very
++        // index being scanned (a merge rewrites the row) and a live cursor guarantees nothing about a result
++        // set that changes under it.
++        val rows = mutableListOf<Download>()
++        downloadManager.downloadIndex
++            .getDownloads(Download.STATE_QUEUED, Download.STATE_DOWNLOADING, Download.STATE_FAILED)
++            .use { cursor ->
++                while (cursor.moveToNext()) {
++                    rows += cursor.download
++                }
++            }
++
++        for (download in rows) {
++            observed += download.request.id
++            val prediction = DownloadRecoveryObservation(
++                    id = download.request.id,
++                    phase = downloadPhaseOf(download.state),
++                    bytesDownloaded = download.bytesDownloaded,
++                    online = online,
++                    // Media3 writes row timestamps from the wall clock while the pass clock is monotonic, so
++                    // the age is measured here, where both clocks are available.
++                    failureAgeMs = if (download.state == Download.STATE_FAILED) {
++                        (System.currentTimeMillis() - download.updateTimeMs).coerceAtLeast(0L)
++                    } else {
++                        null
++                    },
++                    // A failure older than this watch belongs to an earlier process; its retry budget did too.
++                    failureIsFromThisSession = download.updateTimeMs >= watchingSinceWallMs,
++                    rowStartedAtMs = download.startTimeMs,
++            )
++            val action = policy.onObservation(prediction, now)
++            when (action) {
++                DownloadRecoveryAction.RESTART ->
++                    requeue(downloadManager, download, prediction.phase, "Restarting a download with no progress")
++                DownloadRecoveryAction.RETRY ->
++                    requeue(downloadManager, download, prediction.phase, "Retrying a failed download")
++                DownloadRecoveryAction.NONE -> Unit
++            }
++        }
++
++        // Only after a complete read: every row the policy can act on, including one parked in the queue, was
++        // just observed, so anything else has really gone and must not keep a spent budget alive.
++        policy.endPass(observed)
++    }
++
++    /**
++     * Restarts a stalled download or retries a failed one by re-adding its request.
++     *
++     * Media3 merges the request into the existing row and puts it back to `QUEUED`, which cancels the running
++     * task - interrupting a transfer blocked inside the data source, including one blocked in the stream URL
++     * resolution, so this also bounds that call - and starts a fresh task. The download cache is untouched,
++     * so the bytes already fetched are reused and only the missing tail is fetched, and the row keeps its
++     * identity, so the user sees the same download carry on.
++     *
++     * The manager is called directly rather than through `DownloadService.sendAddDownload`, because that
++     * helper starts the service with `startService`, which Android forbids from the background - exactly where
++     * a stalled download is usually found. The trade-off is that a recovery started while the app is in the
++     * background runs without the download service holding the process, so the OS may park it until the app
++     * is next launched; the request keeps its identity and its cached bytes, so it simply carries on then.
++     *
++     * The same call serves both actions because it is the only restart path that never passes through
++     * `STATE_STOPPED`: the app's own listener reads that state as "no longer downloaded" and would clear
++     * `isDownloaded` and `dateDownload` for a re-download that still has a playable cached copy. `removeDownload`
++     * would be worse still - it deletes the cached bytes.
++     */
++    private fun requeue(
++        downloadManager: DownloadManager,
++        download: Download,
++        expectedPhase: DownloadRecoveryPhase,
++        reason: String,
++    ) {
++        val id = download.request.id
++        // Decide from a fresh row, not the snapshot this pass read: re-adding is asynchronous, so a download
++        // the user removed (or that moved on) while the pass was running must not be brought back to life.
++        val current = runCatching { downloadManager.downloadIndex.getDownload(id) }.getOrNull()
++        if (current == null || downloadPhaseOf(current.state) != expectedPhase) {
++            Timber.tag(TAG).d("Skipping %s: its state changed before the action could be applied", id)
++            // Give the budget back: the policy already spent it when it decided, and nothing was done.
++            policy.onActionSkipped(id)
++            return
++        }
++        Timber.tag(TAG).w("%s: %s (%.1f%%)", reason, id, current.percentDownloaded)
++        downloadManager.addDownload(current.request)
++    }
++
++    /**
++     * True when downloads can be expected to reach the internet.
++     *
++     * Requires `VALIDATED` as well as `INTERNET`, deliberately stricter than plain connectivity: a captive
++     * portal reports `INTERNET` without ever validating, and treating that as online would spend a download's
++     * whole recovery budget against a network that cannot serve media. Media3 applies the same check, but only
++     * when a network-type requirement has been set, which this app never does - so the trade-off is ours, and
++     * it cuts the other way on a network that carries media but never validates, where recovery waits instead
++     * of churning.
++     */
++    private fun isOnline(): Boolean {
++        val connectivity = context.getSystemService<ConnectivityManager>() ?: return false
++        val network = connectivity.activeNetwork ?: return false
++        val capabilities = connectivity.getNetworkCapabilities(network) ?: return false
++        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
++            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
++    }
++
++    private companion object {
++        const val TAG = "DownloadWatchdog"
++    }
++}
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt b/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt
 new file mode 100644
 index 00000000..387315ea
@@ -2783,5 +3280,456 @@ index 00000000..b93a3d00
 +        assertFalse(DownloadFormat.usesArtistToken("%album%/%year%"))
 +        assertFalse(DownloadFormat.usesArtistToken(""))
 +        assertFalse(DownloadFormat.usesArtistToken("plain folder"))
++    }
++}
+diff --git a/app/src/test/kotlin/com/music/vivi/playback/DownloadRecoveryTest.kt b/app/src/test/kotlin/com/music/vivi/playback/DownloadRecoveryTest.kt
+new file mode 100644
+index 00000000..342e8fea
+--- /dev/null
++++ b/app/src/test/kotlin/com/music/vivi/playback/DownloadRecoveryTest.kt
+@@ -0,0 +1,445 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class DownloadRecoveryTest {
++
++    private fun policy(
++        stallTimeoutMs: Long = 10_000L,
++        slowTransferTimeoutMs: Long = 60_000L,
++        maxRestartsPerDownload: Int = 2,
++        maxRetriesPerDownload: Int = 1,
++        retryWindowMs: Long = 600_000L,
++    ) = DownloadRecoveryPolicy(
++        stallTimeoutMs = stallTimeoutMs,
++        slowTransferTimeoutMs = slowTransferTimeoutMs,
++        maxRestartsPerDownload = maxRestartsPerDownload,
++        maxRetriesPerDownload = maxRetriesPerDownload,
++        retryWindowMs = retryWindowMs,
++    )
++
++    private fun downloading(
++        id: String = "song",
++        bytes: Long = 0L,
++        online: Boolean = true,
++    ) = DownloadRecoveryObservation(
++        id = id,
++        phase = DownloadRecoveryPhase.DOWNLOADING,
++        bytesDownloaded = bytes,
++        online = online,
++    )
++
++    private fun failed(id: String = "song", online: Boolean = true) = DownloadRecoveryObservation(
++        id = id,
++        phase = DownloadRecoveryPhase.FAILED,
++        bytesDownloaded = 0L,
++        online = online,
++    )
++
++    @Test
++    fun `the default policy restarts at the documented ninety second stall`() {
++        // The literals mirror the default documented in local-patches/README.md, so changing the
++        // constant without changing the documentation fails here; the other timing tests pass their own
++        // timeouts and would not notice.
++        val policy = DownloadRecoveryPolicy()
++        val observation = DownloadRecoveryObservation("song", DownloadRecoveryPhase.DOWNLOADING, 0L)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(observation, 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(observation, 89_999L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(observation, 90_000L))
++    }
++
++    @Test
++    fun `media3 state numbers map to the phases the policy understands`() {
++        // The numbers are Media3's public Download.STATE_* values, so the watchdog adapter needs no logic.
++        assertEquals(DownloadRecoveryPhase.QUEUED, downloadPhaseOf(0))
++        assertEquals(DownloadRecoveryPhase.STOPPED, downloadPhaseOf(1))
++        assertEquals(DownloadRecoveryPhase.DOWNLOADING, downloadPhaseOf(2))
++        assertEquals(DownloadRecoveryPhase.COMPLETED, downloadPhaseOf(3))
++        assertEquals(DownloadRecoveryPhase.FAILED, downloadPhaseOf(4))
++        assertEquals(DownloadRecoveryPhase.REMOVING, downloadPhaseOf(5))
++        assertEquals(DownloadRecoveryPhase.RESTARTING, downloadPhaseOf(7))
++        // 6 is unused by Media3, and anything unknown must be inert rather than guessed at.
++        assertEquals(DownloadRecoveryPhase.OTHER, downloadPhaseOf(6))
++        assertEquals(DownloadRecoveryPhase.OTHER, downloadPhaseOf(99))
++    }
++
++    @Test
++    fun `a downloading download that keeps making progress is left alone`() {
++        val policy = policy()
++        var now = 0L
++        var bytes = 0L
++
++        repeat(12) {
++            assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = bytes), now))
++            now += 5_000L
++            bytes += 512_000L
++        }
++    }
++
++    @Test
++    fun `a downloading download with no progress for the stall timeout is restarted`() {
++        val policy = policy(stallTimeoutMs = 10_000L)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 4_096L), 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 4_096L), 9_999L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 4_096L), 10_000L))
++    }
++
++    @Test
++    fun `a slow transfer that never stalls is still restarted once it outruns the total budget`() {
++        val policy = policy(stallTimeoutMs = 10_000L, slowTransferTimeoutMs = 30_000L)
++        var now = 0L
++        var bytes = 0L
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = bytes), now))
++        // Stop one tick short of the budget: the boundary itself is the trigger, asserted below.
++        while (now < 25_000L) {
++            now += 5_000L
++            bytes += 128_000L
++            assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = bytes), now))
++        }
++        now += 5_000L
++        bytes += 128_000L
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = bytes), now))
++    }
++
++    @Test
++    fun `an offline gap does not carry the stall clocks into the reconnect`() {
++        val policy = policy(stallTimeoutMs = 10_000L, slowTransferTimeoutMs = 60_000L)
++        val offline = DownloadRecoveryObservation("song", DownloadRecoveryPhase.QUEUED, 0L, online = false)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 0L))
++        // Ten minutes with no network: Media3 parks the download in QUEUED and nothing may be charged.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(offline, 60_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(offline, 600_000L))
++        // The first tick after reconnect must re-baseline instead of restarting a download that never stalled.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 600_001L))
++    }
++
++    @Test
++    fun `a download removed between passes loses its watch so a re-download starts fresh`() {
++        val policy = policy(stallTimeoutMs = 1_000L, maxRestartsPerDownload = 1)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 1_000L))
++        // The user cancels the download, so its row is gone from the next pass of the index.
++        policy.endPass(emptySet())
++        // Re-downloading the same song is a new attempt, not one that already spent its budget.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 2_000L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 3_000L))
++    }
++
++    @Test
++    fun `a failure older than the retry window is left alone`() {
++        val policy = policy(retryWindowMs = 600_000L)
++        val oldFailure = DownloadRecoveryObservation(
++            "song",
++            DownloadRecoveryPhase.FAILED,
++            0L,
++            failureAgeMs = 600_001L,
++        )
++
++        // A row from a previous session must not be re-queued on every launch.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(oldFailure, 600_001L))
++    }
++
++    @Test
++    fun `a failure inside the retry window is still retried`() {
++        val policy = policy(retryWindowMs = 600_000L)
++        val freshFailure = DownloadRecoveryObservation(
++            "song",
++            DownloadRecoveryPhase.FAILED,
++            0L,
++            failureAgeMs = 1_000L,
++        )
++
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(freshFailure, 100_000L))
++    }
++
++    @Test
++    fun `the default policy restarts at the documented five minute crawl`() {
++        // The literal mirrors the default documented in local-patches/README.md, so changing the constant fails here.
++        val policy = DownloadRecoveryPolicy()
++        var now = 0L
++        var bytes = 0L
++        val slow = { bytes: Long ->
++            DownloadRecoveryObservation("slow", DownloadRecoveryPhase.DOWNLOADING, bytes)
++        }
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(slow(bytes), now))
++        while (now < 285_000L) {
++            now += 15_000L
++            bytes += 128_000L
++            assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(slow(bytes), now))
++        }
++        now += 15_000L
++        bytes += 128_000L
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(slow(bytes), now))
++    }
++
++    @Test
++    fun `the default policy caps restarts at two and retries at one`() {
++        val policy = DownloadRecoveryPolicy()
++        val stalled = DownloadRecoveryObservation("stalled", DownloadRecoveryPhase.DOWNLOADING, 0L)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(stalled, 1_000_000L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(stalled, 1_090_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(stalled, 1_090_001L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(stalled, 1_180_001L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(stalled, 1_180_002L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(stalled, 5_000_000L))
++
++        val failed = DownloadRecoveryObservation(
++            "failed",
++            DownloadRecoveryPhase.FAILED,
++            0L,
++            failureAgeMs = 1L,
++        )
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(failed, 5_000_001L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed, 5_000_002L))
++    }
++
++    @Test
++    fun `a re-created row gets its restart budget back`() {
++        // The user cancels and re-downloads inside one watch interval; Media3 gives the new row a fresh
++        // start time, so the new attempt must not inherit the two restarts the old one spent.
++        val policy = policy(stallTimeoutMs = 1_000L, maxRestartsPerDownload = 1)
++        val first = { phase: DownloadRecoveryPhase, startedAt: Long ->
++            DownloadRecoveryObservation(
++                "song",
++                phase,
++                0L,
++                rowStartedAtMs = startedAt,
++            )
++        }
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(first(DownloadRecoveryPhase.DOWNLOADING, 100L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(first(DownloadRecoveryPhase.DOWNLOADING, 100L), 1_000L))
++        // New row, new start time: the attempt starts over with a full restart budget.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(first(DownloadRecoveryPhase.DOWNLOADING, 500L), 1_100L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(first(DownloadRecoveryPhase.DOWNLOADING, 500L), 2_100L))
++    }
++
++    @Test
++    fun `a re-created row does not get its retry budget back`() {
++        // Media3 only rebuilds a start time when it merges a terminal row, which is what the watchdog's own
++        // retry does, so the retry cap must survive a start-time change - otherwise a failing download would
++        // be retried forever inside one session.
++        val policy = policy(maxRetriesPerDownload = 1)
++        val failed = { startedAt: Long ->
++            DownloadRecoveryObservation(
++                "song",
++                DownloadRecoveryPhase.FAILED,
++                0L,
++                failureAgeMs = 0L,
++                rowStartedAtMs = startedAt,
++            )
++        }
++
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(failed(100L), 0L))
++        // Media3 resets startTimeMs when it merges this terminal row, which is what our retry did.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed(500L), 1_000L))
++    }
++
++    @Test
++    fun `a failure from a previous session is not retried`() {
++        val policy = policy()
++        val oldFailure = DownloadRecoveryObservation(
++            "song",
++            DownloadRecoveryPhase.FAILED,
++            0L,
++            failureAgeMs = 1_000L,
++            failureIsFromThisSession = false,
++        )
++
++        // Every launch would otherwise re-queue a download that keeps failing, because each new failure
++        // refreshes the row's timestamp and the retry budget only lives as long as the process.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(oldFailure, 0L))
++    }
++
++    @Test
++    fun `a frozen process noticing a rebuild late still does not refill the retry budget`() {
++        // Timing cannot tell the watchdog's own retry apart from a user's re-download: a process that was
++        // frozen for minutes first sees either one late. The budget is therefore per session, and a rebuild
++        // never refills it.
++        val policy = policy(maxRetriesPerDownload = 1)
++        val failed = { startedAt: Long ->
++            DownloadRecoveryObservation(
++                "song",
++                DownloadRecoveryPhase.FAILED,
++                0L,
++                failureAgeMs = 0L,
++                rowStartedAtMs = startedAt,
++            )
++        }
++
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(failed(100L), 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed(500L), 1_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed(900L), 600_000L))
++    }
++
++    @Test
++    fun `a skipped action gives its budget back`() {
++        val policy = policy(stallTimeoutMs = 1_000L, maxRestartsPerDownload = 1)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 1_000L))
++        // The caller found the download had moved on and did nothing, so the budget must not be lost.
++        policy.onActionSkipped("song")
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 1_100L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 2_100L))
++    }
++
++    @Test
++    fun `the policy refuses budgets that would silently disable its rules`() {
++        val invalid = listOf<() -> Any>(
++            { DownloadRecoveryPolicy(stallTimeoutMs = 0L) },
++            { DownloadRecoveryPolicy(slowTransferTimeoutMs = 0L) },
++            { DownloadRecoveryPolicy(maxRestartsPerDownload = 0) },
++            { DownloadRecoveryPolicy(maxRetriesPerDownload = 0) },
++            { DownloadRecoveryPolicy(retryWindowMs = 0L) },
++        )
++        invalid.forEach { construct ->
++            try {
++                construct()
++                throw AssertionError("a non-positive budget was accepted: $construct")
++            } catch (expected: IllegalArgumentException) {
++                // Correct: a zero budget is a misconfiguration, not a policy.
++            }
++        }
++    }
++
++    @Test
++    fun `a queued download is never restarted`() {
++        val policy = policy(stallTimeoutMs = 1_000L, slowTransferTimeoutMs = 2_000L)
++        val queued = DownloadRecoveryObservation(id = "song", phase = DownloadRecoveryPhase.QUEUED, bytesDownloaded = 0L)
++
++        var now = 0L
++        repeat(10) {
++            assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(queued, now))
++            now += 10_000L
++        }
++    }
++
++    @Test
++    fun `nothing is restarted or retried while the device is offline`() {
++        val policy = policy(stallTimeoutMs = 1_000L, slowTransferTimeoutMs = 2_000L)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L, online = false), 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L, online = false), 600_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed(online = false), 600_000L))
++    }
++
++    @Test
++    fun `a failed download is retried once`() {
++        val policy = policy()
++
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(failed(), 0L))
++    }
++
++    @Test
++    fun `a failed download is not retried a second time`() {
++        val policy = policy(maxRetriesPerDownload = 1)
++
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(failed(), 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed(), 1_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed(), 60_000L))
++    }
++
++    @Test
++    fun `restarts are capped per download so a broken file cannot loop forever`() {
++        val policy = policy(stallTimeoutMs = 1_000L, slowTransferTimeoutMs = 5_000L, maxRestartsPerDownload = 2)
++
++        // Each restart re-baselines the clock, so drive it through a fresh stall three times.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 1_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 2_000L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 3_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 4_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 9_999_999L))
++    }
++
++    @Test
++    fun `a download missing from a pass is forgotten so a later download starts fresh`() {
++        val policy = policy(stallTimeoutMs = 1_000L, maxRestartsPerDownload = 1)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 1_000L))
++        // The row is no longer in the index the adapter reads, which is what a finished or removed download
++        // looks like from here; the adapter prunes everything the pass did not see.
++        policy.endPass(emptySet())
++
++        // Re-downloading the same song later is a new watch, not a spent budget.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 2_000L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 3_000L))
++    }
++
++    @Test
++    fun `bytes going backwards counts as progress and resets the stall clock`() {
++        val policy = policy(stallTimeoutMs = 1_000L)
++
++        // A re-download can report fewer bytes than the attempt before it; that change must count as progress
++        // rather than leave the stall clock running from the old byte count.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 500_000L), 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 100_000L), 500L))
++        // Without that reset this tick is 1_400 ms after the first observation and would be a stall.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 100_000L), 1_400L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 100_000L), 1_501L))
++    }
++
++    @Test
++    fun `a failure exactly at the retry window is still retried`() {
++        val policy = policy(retryWindowMs = 600_000L)
++        val atBoundary = DownloadRecoveryObservation(
++            "song",
++            DownloadRecoveryPhase.FAILED,
++            0L,
++            failureAgeMs = 600_000L,
++        )
++
++        // The window is exclusive: the age has to exceed it to disqualify the retry.
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(atBoundary, 0L))
++    }
++
++    @Test
++    fun `a spent budget survives the download being parked in the queue`() {
++        val policy = policy(stallTimeoutMs = 1_000L, maxRestartsPerDownload = 1, maxRetriesPerDownload = 1)
++        val queued = DownloadRecoveryObservation("song", DownloadRecoveryPhase.QUEUED, 0L)
++        val failed = DownloadRecoveryObservation(
++            "song",
++            DownloadRecoveryPhase.FAILED,
++            0L,
++            failureAgeMs = 0L,
++        )
++
++        // A restart parks the row in QUEUED while Media3 cancels the old task and starts a new one, and the
++        // adapter reads queued rows precisely so this does not hand the restart budget back.
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(bytes = 0L), 1_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(queued, 1_100L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 1_200L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(bytes = 0L), 2_300L))
++
++        // Same for the retry budget: one retry, then neither a queued interlude nor another failure re-arms it.
++        assertEquals(DownloadRecoveryAction.RETRY, policy.onObservation(failed, 2_400L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(queued, 2_500L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(failed, 2_600L))
++    }
++
++    @Test
++    fun `tracking is per download so one stalled song does not disturb another`() {
++        val policy = policy(stallTimeoutMs = 1_000L)
++
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(id = "a", bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(id = "b", bytes = 0L), 0L))
++        assertEquals(DownloadRecoveryAction.RESTART, policy.onObservation(downloading(id = "a", bytes = 0L), 1_000L))
++        assertEquals(DownloadRecoveryAction.NONE, policy.onObservation(downloading(id = "b", bytes = 100L), 1_000L))
 +    }
 +}
