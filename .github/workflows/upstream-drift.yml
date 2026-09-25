@@ -53,12 +53,15 @@ jobs:
             echo
             echo "\`local-patches/apply.sh --check\` failed against upstream main (\`${upstream_sha}\`)."
             echo
+            echo "That happens either when a patch no longer applies or when the patch set is incomplete -"
+            echo "a missing \`local-patches/debug.keystore\` fails this check too, so read the step log above."
+            echo
             echo "Rebase the patch onto the new upstream main and regenerate it - see"
             echo "\`local-patches/README.md\`."
           } >>"${GITHUB_STEP_SUMMARY}"
 
           title="Upstream drift: local patches no longer apply"
-          body="\`local-patches/apply.sh --check\` failed against upstream main (\`${upstream_sha}\`)."$'\n\n'"Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="\`local-patches/apply.sh --check\` failed against upstream main (\`${upstream_sha}\`). It fails both when a patch no longer applies and when \`local-patches/debug.keystore\` is missing, so read the log: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search 'Upstream drift in:title' --json number --jq '.[0].number // empty')"
           if [[ -n "${existing}" ]]; then
             gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"

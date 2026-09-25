@@ -1,0 +1,3 @@
+# Certificate every patched build must be signed with (sha256 of the DER certificate).
+# Recorded from local-patches/debug.keystore. A mismatch fails the Local Patch Build.
+8541a964d3d4e0c2d1d1c7ca5a5b665540eecd1ce784e23fdf2f3edaa89192b6

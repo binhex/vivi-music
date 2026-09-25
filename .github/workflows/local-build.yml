@@ -98,19 +98,13 @@ jobs:
             echo '```'
           } >>"${GITHUB_STEP_SUMMARY}"
 
-      - name: Generate debug keystore
+      # Signing is pinned to local-patches/debug.keystore, which the apply step copied into the build
+      # tree as app/persistent-debug.keystore. A fresh keystore per run would make every APK a
+      # different signer for the same package, so Android would refuse to update the installed app.
+      - name: Verify the signing key is pinned and stable
         run: |
           set -euo pipefail
-          mkdir -p "${HOME}/.android"
-          keytool -genkey -v \
-            -keystore "${HOME}/.android/debug.keystore" \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          bash "${GITHUB_WORKSPACE}/patches/local-patches/tests/test-signing-key-stability.sh"
 
       - name: Build APK
         working-directory: src
@@ -118,6 +112,39 @@ jobs:
           set -euo pipefail
           ./gradlew --console=plain --no-configuration-cache \
             "assemble${{ steps.inputs.outputs.variant }}"
+
+      # Every APK must carry the pinned certificate, or it cannot be installed over an existing
+      # install. The expected fingerprint is committed in local-patches/signing-cert.sha256, and the
+      # step fails the job on a mismatch, on a missing pin, or when the checker cannot run.
+      - name: Check the APK signing certificate
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mapfile -t apks < <(find app/build/outputs/apk -name '*.apk')
+          if (( ${#apks[@]} == 0 )); then
+            echo "No APK found under app/build/outputs/apk" >&2
+            exit 1
+          fi
+          pin="${GITHUB_WORKSPACE}/patches/local-patches/signing-cert.sha256"
+          if [[ ! -f "${pin}" ]]; then
+            echo "Missing ${pin}: no APK can be shown to carry the pinned certificate." >&2
+            exit 1
+          fi
+          recorded="$(sed -e 's/#.*//' "${pin}" | awk 'NF { print; exit }')"
+          if [[ ! "${recorded}" =~ ^[[:space:]]*[0-9a-fA-F]{64}[[:space:]]*$ ]]; then
+            echo "${pin} records no fingerprint on its first content line, so the gate would enforce nothing." >&2
+            exit 1
+          fi
+          {
+            echo "### APK signing certificate"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+          status=0
+          python3 "${GITHUB_WORKSPACE}/patches/local-patches/tests/check_apk_signing_cert.py" \
+            --expect-file "${pin}" "${apks[@]}" 2>&1 \
+            | tee -a "${GITHUB_STEP_SUMMARY}" || status=$?
+          echo '```' >>"${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
 
       - name: Run unit tests
         working-directory: src

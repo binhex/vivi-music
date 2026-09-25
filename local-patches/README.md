@@ -9,7 +9,9 @@ pulled in without touching our code.
 | Path | Purpose |
 | --- | --- |
 | `local-patches/*.patch` | One patch per feature, applied in filename order. |
-| `local-patches/apply.sh` | Applies (or `--check`s) every patch against the current checkout. |
+| `local-patches/apply.sh` | Applies (or `--check`s) every patch against the current checkout, and installs the pinned signing key. |
+| `local-patches/debug.keystore` | The pinned debug signing key, so builds can update each other in place. |
+| `local-patches/tests/` | Regression tests for the patch set itself; see *Tests* below. |
 | `.github/workflows/local-build.yml` | Applies the patches to upstream `main`, builds a debug APK. |
 | `.github/workflows/upstream-drift.yml` | Weekly canary: do the patches still apply to upstream `main`? |
 
@@ -25,7 +27,80 @@ official app because debug builds use `applicationIdSuffix = ".debug"`. A lint r
 the same run.
 
 Pushing to `main` also rebuilds automatically whenever `local-patches/**` changes. Upstream's own
-`build.yml` triggers on every branch push too, so a push normally produces a `gms` APK as well.
+`build.yml` triggers on every branch push too, so a push normally produces a `gms` APK as well. That
+one is built without the patches and signed with a throw-away key, so it is not updatable over a pinned
+install - see *Updating an installed APK*.
+
+## Updating an installed APK
+
+Android only installs an update in place when the new APK is signed with the same certificate as the
+installed app. Otherwise the installer reports *"App not installed as package conflicts with an
+existing package"* and the only way forward is to uninstall first. Every patched build therefore signs
+with one pinned key:
+
+| Piece | Purpose |
+| --- | --- |
+| `local-patches/debug.keystore` | The pinned debug key. Committed on purpose: it is a debug key, and CI and local builds must use the same file. |
+| `local-patches/apply.sh` | Installs it as `app/persistent-debug.keystore`, and refuses to patch a tree without it. |
+| `01-download-folder.patch` | Makes the debug `signingConfig` prefer `app/persistent-debug.keystore` when present, falling back to `~/.android/debug.keystore` (with a build warning) otherwise. |
+
+Consequences:
+
+- An APK from **Local Patch Build** and one from a local patched build can update each other.
+- The first install after this change needs one uninstall, because the app already on the device was
+  signed with one of the old, per-run CI keys.
+- Replacing `local-patches/debug.keystore` later costs the same one uninstall, so keep a copy.
+- Only APKs from **Local Patch Build** or a local patched build carry the pinned key. The fork's other
+  workflows - `build.yml`, `build_pr.yml`, `nightly.yml`, `release.yml`, `beta_release.yml` - still
+  generate a throw-away key per run, so an APK from one of those conflicts with a pinned install in
+  both directions: updating across the two needs one uninstall.
+- The pinned key is a debug key and its private material is public. It must never sign a release or
+  Play-bound artifact. That matters here because `app/build.gradle.kts` signs `release` with the debug
+  `signingConfig` whenever `app/keystore/release.keystore` is missing, so a release build from a patched
+  tree would be signed with this key while carrying the real `com.vivi.vivimusic` package id.
+- `apply.sh` overwrites `app/persistent-debug.keystore` if it exists, and the patched debug
+  `signingConfig` prefers that file. Upstream's `development_guide.md` tells developers to create it with
+  their own key, while upstream's debug config points at `~/.android/debug.keystore` instead (its
+  `persistentDebug` config is unused), so a build made before this patch set, or without it, is signed
+  differently and needs the one uninstall above.
+
+To recreate the key (only if it is lost):
+
+```bash
+keytool -genkeypair -v -keystore local-patches/debug.keystore -storepass android \
+  -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+  -dname "CN=Android Debug,O=Android,C=US"
+```
+
+### Pinning the certificate in CI
+
+`local-patches/signing-cert.sha256` holds the certificate fingerprint every built APK must carry, and
+the build fails on a mismatch. It currently records the committed keystore's certificate, so a build
+signed with any other key is rejected. Re-record it after replacing the key, either from the new
+certificate (`keytool -exportcert -rfc` then `openssl x509 -outform DER | sha256sum`) or from the
+*APK signing certificate* line of a run that used it.
+
+The file holds one 64-hex fingerprint, optionally followed by a `#` comment; the CI step rejects a file
+that records none. The checker alone is deliberately lenient about a missing or empty expectation - it
+reports a NOTICE - so the pre-checks in the workflow are what make the gate strict.
+
+### Tests
+
+```bash
+local-patches/tests/test-signing-key-stability.sh
+uv run --no-project --with pytest pytest local-patches/tests/test_check_apk_signing_cert.py
+```
+
+The first script checks the patch-set plumbing with no Gradle, Android SDK or device involved, and
+reports `PENDING` for the one check that needs the real keystore when that file is absent. Its workflow
+assertions read the YAML text with comments stripped, so they guard against regressions rather than
+proving the job is wired correctly - only a CI run proves that. The second suite covers the helper that
+reads a certificate out of an APK. To reproduce the original install failure, compare any two APKs by
+hand:
+
+```bash
+uv run --no-project python local-patches/tests/check_apk_signing_cert.py app-one.apk app-two.apk
+```
 
 ## What patch 01 does
 
@@ -77,10 +152,11 @@ acting, the row is read again so a download the user deleted cannot be brought b
 - The private Media3 download cache is never modified, so an export failure cannot break offline
   playback: the copy is read from the cache and only the new file is touched.
 
-Footprint: 12 new files, plus **80 added lines** in four upstream files -
+Footprint: 12 new files, plus **93 added lines** in four upstream files -
 `DownloadUtil.kt` (constructor parameter + one call in the `STATE_COMPLETED` branch),
 `StorageSettings.kt` (one call to `LocalDownloadSettingsGroup()`),
-`app/build.gradle.kts` (Kover wiring, the `AlbumArtist*` coverage scope and `testImplementation(libs.junit)`)
+`app/build.gradle.kts` (Kover wiring, the `AlbumArtist*` coverage scope, `testImplementation(libs.junit)`
+and the pinned debug `signingConfig`)
 and `DatabaseDao.kt` (a suspend query for the album position plus three for the album's credited artists
 and performer spread). The watchdog's share of that is small and reversible: one constructor parameter, one
 `start` call, and closing the index cursor the same `init` block used to leak, plus the one Kover filter line

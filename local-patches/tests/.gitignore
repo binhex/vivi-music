@@ -1,0 +1,5 @@
+# By-products of running the suites here. The repository has no Python ignore rules of its own
+# (it has no Python package), so keep them local to this directory.
+__pycache__/
+.pytest_cache/
+.coverage
