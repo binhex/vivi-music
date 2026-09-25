@@ -703,10 +703,10 @@ index 00000000..b8416caf
 +private const val ALBUM_ARTIST_TAG = "AlbumArtist"
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt
 new file mode 100644
-index 00000000..6961b221
+index 00000000..fdbb9cf5
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadFormat.kt
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,378 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -719,8 +719,12 @@ index 00000000..6961b221
 +    /** Organise downloads by artist and album unless the user says otherwise. */
 +    const val DEFAULT_FOLDER_TEMPLATE = "%artist%/%album%"
 +
-+    /** The file-name template used when the preference is unset, emptied or blank. */
-+    const val DEFAULT_FILE_TEMPLATE = "%artist% - %album% - %tracknumber% - %title%"
++    /**
++     * The file-name template used when the preference is unset, emptied or blank. The track number leads,
++     * so a folder of downloads sorts in album order; a track with no album position drops that one part and
++     * the name starts with the artist instead.
++     */
++    const val DEFAULT_FILE_TEMPLATE = "%tracknumber% - %artist% - %album% - %title%"
 +
 +    const val MAX_SEGMENTS = 6
 +
@@ -1103,7 +1107,7 @@ index df48f9bb..d3725f5b 100644
                                  Download.STATE_STOPPED,
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt b/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt
 new file mode 100644
-index 00000000..1374f0f9
+index 00000000..387315ea
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/LocalDownloadPrefs.kt
 @@ -0,0 +1,30 @@
@@ -1132,17 +1136,17 @@ index 00000000..1374f0f9
 +/** Folder structure template such as `%artist%/%album%`; empty means flat. */
 +val DownloadFolderTemplateKey = stringPreferencesKey("downloadFolderTemplate")
 +
-+/** File-name template such as `%artist% - %album% - %tracknumber% - %title%`; blank means the default. */
++/** File-name template such as `%tracknumber% - %artist% - %album% - %title%`; blank means the default. */
 +val DownloadFormatFileKey = stringPreferencesKey("downloadFormatFile")
 +
 +/** Whether trailing video tags are stripped from metadata before it reaches a folder or file name. */
 +val DownloadFormatCleanKey = booleanPreferencesKey("downloadFormatClean")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
 new file mode 100644
-index 00000000..a33e48bb
+index 00000000..9f4e166c
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/SafFolders.kt
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,167 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1169,12 +1173,42 @@ index 00000000..a33e48bb
 + */
 +internal object SafFolders {
 +
-+    /** Display name of the picked folder, or null when the grant is gone or the folder is unreadable. */
-+    fun displayName(context: Context, treeUri: Uri): String? = runCatching {
-+        query(context, documentUri(treeUri), arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) {
-+            it.getString(0)
-+        }
++    /**
++     * The picked folder's full path for the settings row, such as "Internal storage/Music/Vivi".
++     *
++     * A tree URI carries only the provider's document id ("primary:Music/Vivi"), so the volume's own title
++     * has to be read from the provider's root list. A failed title lookup falls back to the raw volume id
++     * unless it is the opaque "primary", which on its own would only confuse. Null means the provider could
++     * not be asked at all, which is how a revoked grant or an unreadable folder shows up.
++     */
++    fun displayPath(context: Context, treeUri: Uri): String? = runCatching {
++        val documentId = DocumentsContract.getTreeDocumentId(treeUri)
++        val volumeId = documentId.substringBefore(':', documentId)
++        val path = documentId.substringAfter(':', "").trim('/')
++        val volume = rootTitle(context, treeUri.authority, volumeId)
++            ?: volumeId.takeIf { it.isNotEmpty() && it != PRIMARY_VOLUME_ID }
++        listOfNotNull(volume, path.takeIf { it.isNotEmpty() }).joinToString("/")
 +    }.getOrNull()
++
++    /** The provider's own title for [volumeId], such as "Internal storage"; null when it cannot be read. */
++    private fun rootTitle(context: Context, authority: String?, volumeId: String): String? {
++        if (authority == null) return null
++        return query(
++            context,
++            DocumentsContract.buildRootsUri(authority),
++            arrayOf(DocumentsContract.Root.COLUMN_ROOT_ID, DocumentsContract.Root.COLUMN_TITLE),
++        ) { cursor ->
++            var title: String? = null
++            // query() has already positioned the cursor on the first row, so start there.
++            do {
++                if (cursor.getString(0) == volumeId) {
++                    title = cursor.getString(1)
++                    break
++                }
++            } while (cursor.moveToNext())
++            title
++        }
++    }
 +
 +    /**
 +     * Walks [segments] below the tree root, creating the directories that are missing, and returns the
@@ -1277,9 +1311,12 @@ index 00000000..a33e48bb
 +}
 +
 +private const val TAG = "SafFolders"
++
++/** Primary shared storage's document id; its raw value is not worth showing to a user. */
++private const val PRIMARY_VOLUME_ID = "primary"
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 new file mode 100644
-index 00000000..e645af31
+index 00000000..ff538e3a
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalDownloadSettings.kt
 @@ -0,0 +1,447 @@
@@ -1400,23 +1437,23 @@ index 00000000..e645af31
 +        sampleFolderArtists = foundFolderArtists
 +    }
 +
-+    var folderName by remember(folderUri) { mutableStateOf<String?>(null) }
++    var folderPath by remember(folderUri) { mutableStateOf<String?>(null) }
 +    // Starts true when a folder is configured, so the description does not flash "access lost" before the
 +    // provider answers.
 +    var resolving by remember(folderUri) { mutableStateOf(folderUri.isNotBlank()) }
 +
-+    // Resolving the display name touches the documents provider, so keep it off the main thread. A
-+    // null result is how a revoked grant shows up: the provider throws, and SafFolders reports null.
++    // Resolving the full path touches the documents provider, so keep it off the main thread. A null
++    // result is how a revoked grant shows up: the provider throws, and SafFolders reports null.
 +    LaunchedEffect(folderUri) {
-+        folderName = null
++        folderPath = null
 +        resolving = folderUri.isNotBlank()
 +        if (folderUri.isNotBlank()) {
 +            val resolved = withContext(Dispatchers.IO) {
-+                SafFolders.displayName(context, folderUri.toUri())
++                SafFolders.displayPath(context, folderUri.toUri())
 +            }
 +            // A newer folder may already have been picked while this lookup was running.
 +            if (isActive) {
-+                folderName = resolved
++                folderPath = resolved
 +                resolving = false
 +            }
 +        }
@@ -1450,14 +1487,14 @@ index 00000000..e645af31
 +                    icon = painterResource(R.drawable.download),
 +                    title = { Text(stringResource(R.string.download_folder_export)) },
 +                    description = {
-+                        val name = folderName
++                        val path = folderPath
 +                        Text(
 +                            text = when {
 +                                !exportEnabled -> stringResource(R.string.download_folder_off)
 +                                folderUri.isBlank() ->
 +                                    stringResource(R.string.download_folder_default)
 +                                resolving -> stringResource(R.string.download_folder_checking)
-+                                name != null -> stringResource(R.string.download_folder_current, name)
++                                path != null -> stringResource(R.string.download_folder_current, path)
 +                                else -> stringResource(R.string.download_folder_permission_lost)
 +                            },
 +                        )
@@ -1529,7 +1566,7 @@ index 00000000..e645af31
 +            field = field,
 +            folderTemplate = folderTemplate,
 +            fileTemplate = DownloadFormat.fileTemplateOrDefault(fileTemplate),
-+            rootLabel = folderName ?: stringResource(R.string.download_folder_default_root),
++            rootLabel = folderPath ?: stringResource(R.string.download_folder_default_root),
 +            sampleSong = sampleSong,
 +            sampleTrackNumber = sampleTrackNumber,
 +            sampleFolderArtists = sampleFolderArtists,
@@ -1989,7 +2026,7 @@ index 00000000..c275c447
 +}
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/DownloadFormatTest.kt b/app/src/test/kotlin/com/music/vivi/playback/DownloadFormatTest.kt
 new file mode 100644
-index 00000000..3da43543
+index 00000000..b93a3d00
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/DownloadFormatTest.kt
 @@ -0,0 +1,755 @@
@@ -2297,9 +2334,9 @@ index 00000000..3da43543
 +    }
 +
 +    @Test
-+    fun `default file template writes artist album track and title`() {
++    fun `default file template leads with the track number`() {
 +        assertEquals(
-+            "Metallica - Master Of Puppets - 10 - Battery.m4a",
++            "10 - Metallica - Master Of Puppets - Battery.m4a",
 +            DownloadFormat.fileName(
 +                input(title = "Battery", trackNumber = 10),
 +                DownloadFormat.DEFAULT_FILE_TEMPLATE,
@@ -2467,7 +2504,7 @@ index 00000000..3da43543
 +            "audio/mp4",
 +        )
 +        assertEquals(
-+            "Metallica - Master Of Puppets - 05 - " + "A".repeat(79) + "..." + "A".repeat(116) + ".m4a",
++            "05 - Metallica - Master Of Puppets - " + "A".repeat(79) + "..." + "A".repeat(116) + ".m4a",
 +            name,
 +        )
 +    }

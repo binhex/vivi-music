@@ -46,8 +46,8 @@ in a file manager or any other music player:
   it. The *file-name* format keeps using the track's own artist, so a compilation's folder is uniform while
   each file name still names its performer.
 - Optional **file-name** template in *Settings -> Storage -> Download format -> File format*, defaulting to
-  `%artist% - %album% - %tracknumber% - %title%`, so an album download lands as
-  `Metallica - Master Of Puppets - 10 - Battery.webm` and sorts in album order. A part whose token has no
+  `%tracknumber% - %artist% - %album% - %title%`, so an album download lands as
+  `10 - Metallica - Master Of Puppets - Battery.webm` and sorts in album order. A part whose token has no
   value disappears together with its separator, and an emptied or blank file template means the built-in
   default. Track numbers come from the album position already stored in `song_album_map` (two digits up to
   99, raw above), so a download taken from a search or playlist, which has no album row, simply carries no
@@ -156,7 +156,8 @@ cd /tmp/vivi-check && /path/to/this/repo/local-patches/apply.sh --check
 - GitHub disables scheduled workflows after 60 days without repository activity. If the weekly drift
   check stops running, re-enable it from the Actions tab.
 - On-device checklist for patch 01: pick a folder and confirm the setting immediately reads
-  `Folder: <name>` (not "Folder access lost"); pick the **same** folder again and confirm the grant
+  `Folder: <volume>/<path>` - the full path, not just the folder's own name - (not "Folder access
+  lost"); pick the **same** folder again and confirm the grant
   survives; set the folder structure to `%artist%/%album%` and confirm a download lands in nested
   `Artist/Album/` folders under both roots; clear the template and confirm flat output, then press
   Reset and confirm the default returns; download a song and confirm it lands in that folder and
