@@ -36,7 +36,8 @@ def _central_directory_offset(data: bytes) -> int:
         if position + 22 <= len(data):
             comment_length = struct.unpack_from("<H", data, position + 20)[0]
             if position + 22 + comment_length == len(data):
-                return struct.unpack_from("<I", data, position + 16)[0]
+                # int() is only for the strict type checker: struct.unpack_from returns Any.
+                return int(struct.unpack_from("<I", data, position + 16)[0])
 
 
 def _signing_block(data: bytes) -> bytes:
@@ -105,19 +106,59 @@ def _signing_certificate(signed_data: bytes) -> bytes | None:
     return certificate_list[0] if certificate_list else None
 
 
+def _signers(block_value: bytes) -> list[bytes]:
+    """Return the signers of one signing block.
+
+    A block value is a length-prefixed sequence holding length-prefixed signers, so the sequence
+    level has to be peeled off first. Treating its content as a signer shifts every later field by
+    one length prefix, which lands on the signature structure instead of the certificate.
+    """
+    sequence = _length_prefixed_values(block_value)
+    if len(sequence) != 1:
+        raise ApkFormatError("a signing block value must hold one signers sequence")
+    return _length_prefixed_values(sequence[0])
+
+
+def _is_der_certificate(blob: bytes) -> bool:
+    """Say whether `blob` is framed like a DER certificate rather than a shifted length prefix.
+
+    A certificate is a SEQUENCE whose declared length fills the blob. The check is deliberately
+    narrow rather than a DER validator: it accepts any self-consistent length frame, including
+    non-minimal encodings. A walk that landed on a signature or a digest record cannot pass, because
+    those frames do not fill their blob; a public key is itself a self-consistent SEQUENCE, so a walk
+    that landed on one would be reported rather than rejected.
+    """
+    if len(blob) < 4 or blob[0] != 0x30:
+        return False
+    if blob[1] < 0x80:
+        return blob[1] == len(blob) - 2
+    length_bytes = blob[1] & 0x7F
+    if length_bytes == 0 or length_bytes > 4 or len(blob) < 2 + length_bytes:
+        # 0x80 is indefinite length, which DER forbids and no certificate uses.
+        return False
+    declared = int.from_bytes(blob[2 : 2 + length_bytes], "big")
+    return declared == len(blob) - 2 - length_bytes
+
+
 def _certificates(block_value: bytes) -> list[bytes]:
     """Pull the signing certificate out of each signer of one signing block."""
     certificates: list[bytes] = []
-    for signer in _length_prefixed_values(block_value):
+    for signer in _signers(block_value):
         if len(signer) < 4:
             raise ApkFormatError("truncated signer")
         signed_data_length = struct.unpack_from("<I", signer, 0)[0]
         if signed_data_length > len(signer) - 4:
             raise ApkFormatError("signer declares more signed data than it carries")
         certificate = _signing_certificate(signer[4 : 4 + signed_data_length])
-        if certificate:
-            # A signer's certificate is the first entry of its chain.
-            certificates.append(certificate)
+        if certificate is None:
+            continue
+        if not _is_der_certificate(certificate):
+            # Never hash a blob that is not a certificate: that is how a signature structure gets
+            # reported as a fingerprint and a correctly signed APK gets failed.
+            raise ApkFormatError(
+                "the signer's first certificate is not a DER certificate"
+            )
+        certificates.append(certificate)
     return certificates
 
 
@@ -204,6 +245,26 @@ def _resolve_expected(args: argparse.Namespace) -> tuple[str | None, int]:
     return recorded or _normalise_fingerprint(args.expect), 0
 
 
+def _multi_signed_apks(results: dict[str, list[str]]) -> list[str]:
+    """Return the APKs that carry more than one certificate."""
+    return [apk for apk, certificates in results.items() if len(certificates) > 1]
+
+
+def _report_multi_signed(results: dict[str, list[str]]) -> bool:
+    """Name every multi-signed APK, returning whether any was found.
+
+    A multi-signed APK cannot update a single-signed install and this gate speaks about one
+    certificate, so it is rejected by name rather than as a difference between APKs.
+    """
+    apks = _multi_signed_apks(results)
+    for apk in apks:
+        print(
+            f"MISMATCH: {apk} is signed with {len(results[apk])} certificates, "
+            "which this gate does not accept"
+        )
+    return bool(apks)
+
+
 def _report(results: dict[str, list[str]], expected: str | None) -> int:
     """Print every fingerprint, returning 0 only when they agree with each other and `expected`."""
     seen: set[str] = set()
@@ -211,6 +272,10 @@ def _report(results: dict[str, list[str]], expected: str | None) -> int:
         for fingerprint in fingerprints:
             print(f"{fingerprint}  {apk}")
             seen.add(fingerprint)
+
+    # Every APK is printed before any rejection: CI passes every APK it built in one invocation.
+    if _report_multi_signed(results):
+        return 1
 
     if len(seen) > 1:
         print("MISMATCH: the listed APKs are signed with different certificates")
