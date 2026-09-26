@@ -163,12 +163,40 @@ and performer spread). The watchdog's share of that is small and reversible: one
 for its pure unit - so removing the feature again means deleting the patch's own files and reverting those
 few lines.
 
+## What patch 02 does
+
+`02-recommendations.patch` stops the home-screen recommendation rows suggesting music you already own and
+lets you decide how much they show:
+
+- Quick Picks, Your Daily Discovery and Covers & Remixes hide anything already downloaded. Similar
+  Recommendations and Forgotten Favorites are filtered the same way, as are Keep Listening's songs and
+  albums; Keep Listening's artist cards are not filtered, because their ids are YouTube channel ids, which
+  never appear in the download set.
+- Downloaded songs are added to the seeds of Quick Picks and Daily Discover, so a downloaded but unplayed
+  track also pulls in related music.
+- Covers & Remixes keeps YouTube's own shelf first, then pads the row from local cover/remix searches so it
+  reaches the configured size.
+- Three settings under *Settings -> Content -> Recommendations* set the item count for each of the three
+  sections (10 to 200, default 50).
+- Only downloads in Media3's completed state count as downloaded; album cards are hidden only when every
+  track they contain is downloaded (playlist cards are filtered by id only, because playlist membership
+  cannot be resolved from the database, and at most the first eight album cards in a row are checked), and a
+  section that ends up with nothing is not shown.
+
+Upstream files touched: `viewmodels/HomeViewModel.kt` (the hooks: one constructor parameter, the size and
+download-state reads, two small helpers, and the filter, seed and padding call sites - 245 added lines),
+`ui/screens/settings/ContentSettings.kt` (one line) and `app/build.gradle.kts` (four lines inside patch 01's
+Kover block).
+
+Changing a size takes effect on the next home refresh, not immediately.
+
 ## Known limitations (accepted for now)
 
 | Limitation | Notes |
 | --- | --- |
 | Only downloads that finish *after* the feature is on get exported | There is no sweep for the existing library and no retry for a failed export. A one-shot "export existing downloads" action is the natural follow-up. |
 | Same artist + title means one file | Two different songs that share artist and title (likely when the artist is unknown, e.g. `Unknown Artist - Intro.m4a`) map to the same name and the later export replaces the earlier one. Adding `%songId%` to the template avoids it. |
+| Daily Discover's lookups grow with its size, up to the seed cap | That row fetches a panel per seed and takes several items from each, with up to 30 played seeds plus five downloaded ones, so a larger size means more network work up to 35 lookups per refresh on the same InnerTube client playback metadata uses; beyond that the lookup count is constant. Quick Picks and Covers & Remixes do not scale their lookups with their size. |
 | Changing the template does not move existing files | Only new exports use the new structure; files already written stay where they are, and a copy written by the Music/Vivi fallback is not cleaned up when the chosen folder starts working again. Reorganising them stays out of scope. |
 | A directory carries the export's name | A child that is a folder is left alone and logged, so a folder is never deleted recursively. The export is then staged under the requested name, which the provider uniquifies, so repeated exports add copies rather than replacing that name. |
 | A cancelled export still finishes the copy | The copy loop has no suspension points (blocking IO on purpose), so cancellation is observed after the file is written. The result is correct and idempotent. |
@@ -208,11 +236,14 @@ is explicit in `app/build.gradle.kts`:
   filters
   `com.music.vivi.playback.DownloadFormat*`, `com.music.vivi.playback.AlbumArtist*` and
   `com.music.vivi.playback.DownloadRecovery*` - the last one covering the policy, its observation and its
-  action/phase enums, because they all share that prefix.
+  action/phase enums, because they all share that prefix. Patch 02 adds `RecommendationFilter*` and
+  `DownloadedIds*` to the same filter; a local JaCoCo run over their unit tests reports 17/17 and 2/2 lines
+  with 14/14 branches, again 100%.
 - **Excluded from the measured scope, because they need Robolectric or a device:** `DownloadFolderExporter`,
-`SafFolders`, `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`, `DownloadWatchdog`. The gate's
-  `includes` filter limits measurement to `DownloadFormat*`, `AlbumArtist*` and `DownloadRecovery*`, so these
-  are named debt here rather than listed in the build file.
+`SafFolders`, `LocalDownloadPrefs`, `DownloadUtil`, `LocalDownloadSettings`, `DownloadWatchdog` and - added by
+patch 02 - `LocalRecommendationPrefs`, `LocalRecommendationSettings` and the `HomeViewModel` hooks. The gate's
+  `includes` filter limits measurement to `DownloadFormat*`, `AlbumArtist*`, `DownloadRecovery*`,
+  `RecommendationFilter*` and `DownloadedIds*`, so these are named debt here rather than listed in the build file.
 - **Not measured at all (named debt):** the `canvas`, `innertube` and `lyricsProvider` modules. Wiring
   Kover into them means build-file contact in modules this patch never touches, and a 95% bound there
   would likely fail on pre-existing coverage. Agreed with the maintainer to record it as debt.

@@ -8,7 +8,9 @@
 #   local-patches/apply.sh           # apply for real
 #
 # It exits non-zero on the first patch that does not apply, which is what makes it double as the
-# upstream-drift canary in CI.
+# upstream-drift canary in CI. Patches are applied in filename order, so one patch may build on lines an
+# earlier patch adds; --check therefore validates them cumulatively in a throwaway index while leaving
+# the worktree untouched.
 set -euo pipefail
 
 PATCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,10 +65,31 @@ install_pinned_keystore() {
 # Validate before patching: refusing afterwards would leave a half-applied tree with no pinned key.
 require_pinned_keystore
 
+# Check mode applies every patch in filename order to a throwaway index seeded from HEAD, because a later
+# patch may build on lines an earlier one adds. Seeding from HEAD keeps the check honest - the index holds
+# exactly what a clean checkout would have - and nothing is written to the worktree, which is what makes
+# the weekly drift canary safe to run.
+check_index=""
+cleanup() {
+  if [[ -n "${check_index}" ]]; then
+    rm -rf "$(dirname "${check_index}")"
+  fi
+}
+trap cleanup EXIT
+if [[ "${mode}" == "check" ]]; then
+  check_index="$(mktemp -d "${TMPDIR:-/tmp}/vivi-apply-check.XXXXXX")/index"
+  # A fresh `git init` tree has no HEAD to seed from (the signing-key fixtures are like that), so fall
+  # back to the worktree contents; either way the index describes the state the patches are checked
+  # against, and neither writes to the worktree or to the real index.
+  if ! GIT_INDEX_FILE="${check_index}" git read-tree HEAD 2>/dev/null; then
+    GIT_INDEX_FILE="${check_index}" git add -A
+  fi
+fi
+
 for patch in "${patches[@]}"; do
   name="$(basename "${patch}")"
   if [[ "${mode}" == "check" ]]; then
-    git apply --check --verbose "${patch}"
+    GIT_INDEX_FILE="${check_index}" git apply --cached --verbose "${patch}"
     echo "OK   ${name} (applies)"
   else
     git apply --verbose "${patch}"

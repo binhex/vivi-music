@@ -50,13 +50,36 @@ Local test harness (already present on this machine, verified working):
 /tmp/ktool/run-album-artist-tests.sh   the shape to copy for a new runner
 ```
 
+## Upstream drift found during implementation (2026-09-26)
+
+The scratch tree is a fresh clone of current upstream `main`, which is newer than this fork's own snapshot.
+Three plan statements are superseded by what the code actually looks like. Where a task below conflicts with
+this section, this section wins; the intent of every task is unchanged.
+
+1. **`getQuickPicks()` no longer exists.** Upstream split it into `getQuickPicksLocal()` and
+   `enrichQuickPicksFromNetwork()` (launched from `loadNetworkDataPhase`). Task 9 therefore applies the
+   filtering and `quickPicksSize` in `getQuickPicksLocal` (related songs, forgotten favourites, every
+   fallback tier, the `ifEmpty` fallback and the `LAST_LISTEN` branch) and puts the downloaded-seed block in
+   `enrichQuickPicksFromNetwork`, after the existing `YouTube.related(...)` call and after the
+   `endpoint == null` early return so the lookups stay bounded. Upstream's new `QP_TIMING` logs and the new
+   phase-2 job wiring are left as they are.
+2. **`keepSuggestible` needs two shapes, not one.** The Room entity `Album` extends the sealed `LocalItem`,
+   not `YTItem`, so a `List<YTItem>` helper cannot accept `mostPlayedAlbums()`, and `item is Album` on a
+   `YTItem` is an impossible check. Task 8 therefore provides `keepSuggestible(items: List<YTItem>)` for
+   innertube items (Similar Recommendations, using `albumSongs(browseId)` for innertube albums) and
+   `keepSuggestibleAlbums(items: List<Album>)` for the Keep Listening database row, which keeps the existing
+   `it.album.thumbnailUrl` filter instead of a cast.
+3. **`loadMoreYouTubeItems` also writes the Covers & Remixes row.** It is not named in Task 11, but it
+   appends to the same row, so the same `keepUndownloaded` filter is applied there too; otherwise the
+   "load more" path could reintroduce downloaded items into a row the spec says must not show them.
+
 ## File map
 
 **Created inside the patch (fork-owned):**
 
 | Path | Responsibility |
 | --- | --- |
-| `app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt` | Pure rules: clamp, completed-id set, exclusion, resize, collection rule, seeds, padding |
+| `app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt` | Pure rules: clamp, completed-id set, exclusion, collection rule, seeds, padding |
 | `app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt` | Pure mapper from Media3's id to state map into filter snapshots |
 | `app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt` | Three DataStore int keys |
 | `app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt` | Settings group: three rows opening a number dialog |
@@ -70,7 +93,8 @@ Local test harness (already present on this machine, verified working):
 | --- | --- |
 | `app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt` | Inject `DownloadUtil`; read sizes and download states; filter six rows; add downloaded seeds; pad the covers row; use configured sizes |
 | `app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt` | One line calling `LocalRecommendationSettingsGroup()` |
-| `app/build.gradle.kts` | Two lines inside patch 01's `kover { }` block, adding the new classes to the coverage allowlist |
+| `app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt` | One line: promote the private Media3 completed-state constant so the filter can alias it instead of duplicating it |
+| `app/build.gradle.kts` | Four lines inside patch 01's `kover { }` block, adding the new classes to the coverage allowlist |
 
 **Fork-owned files committed by this plan:**
 
@@ -164,7 +188,7 @@ Expected: `OK (n tests)` from JUnitCore and coverage lines for `AlbumArtistKt`, 
 - [ ] **Step 5: Commit the scratch state**
 
 ```bash
-cd /tmp/vivi-reco && git add -A && git -c user.email=patch@local -c user.name=patch commit -qm "harness ready" 
+cd /tmp/vivi-reco && git add -A && git -c user.email=patch@local -c user.name=patch commit -qm "harness ready"
 ```
 
 ---
@@ -226,7 +250,12 @@ class RecommendationFilterTest {
 
         assertEquals(200, RecommendationFilter.resize(items, 999).size)
         assertEquals(50, RecommendationFilter.resize(items, 50).size)
-        assertEquals(10, RecommendationFilter.resize(listOf("a"), 1).size)
+        assertEquals(10, RecommendationFilter.resize((1..20).map { it.toString() }, 1).size)
+    }
+
+    @Test
+    fun `resize never invents items`() {
+        assertEquals(1, RecommendationFilter.resize(listOf("a"), 1).size)
     }
 }
 ```
@@ -295,7 +324,7 @@ object RecommendationFilter {
 bash /tmp/ktool/run-recommendation-filter-tests.sh /tmp/vivi-reco
 ```
 
-Expected: `OK (4 tests)` and coverage lines for `RecommendationFilter` showing zero missed lines.
+Expected: `OK (5 tests)` and coverage lines for `RecommendationFilter` showing zero missed lines.
 
 - [ ] **Step 5: Commit**
 
@@ -385,7 +414,7 @@ Add to `RecommendationFilter` (after `clampSize`):
 bash /tmp/ktool/run-recommendation-filter-tests.sh /tmp/vivi-reco
 ```
 
-Expected: `OK (8 tests)`.
+Expected: `OK (9 tests)`.
 
 - [ ] **Step 5: Commit**
 
@@ -443,12 +472,28 @@ Append to `RecommendationFilterTest.kt`:
         val padded = RecommendationFilter.pad(
             remote = listOf("r1", "r2", "shared"),
             local = listOf("l1", "shared", "l2"),
-            size = 4,
+            size = 10,
             downloadedIds = emptySet(),
             idOf = { it },
         )
 
-        assertEquals(listOf("r1", "r2", "shared", "l1"), padded)
+        assertEquals(listOf("r1", "r2", "shared", "l1", "l2"), padded)
+    }
+
+    @Test
+    fun `pad caps the row at the configured size`() {
+        val remote = (1..12).map { "r$it" }
+
+        val padded = RecommendationFilter.pad(
+            remote = remote,
+            local = emptyList(),
+            size = 10,
+            downloadedIds = emptySet(),
+            idOf = { it },
+        )
+
+        assertEquals(10, padded.size)
+        assertEquals(remote.take(10), padded)
     }
 
     @Test
@@ -531,7 +576,7 @@ Add to `RecommendationFilter` (after `keepCollection`):
 bash /tmp/ktool/run-recommendation-filter-tests.sh /tmp/vivi-reco
 ```
 
-Expected: `OK (14 tests)` and a `RecommendationFilterKt` line with zero missed lines.
+Expected: `OK (16 tests)` and a `RecommendationFilter` line with zero missed lines.
 
 - [ ] **Step 5: Commit**
 
@@ -632,7 +677,7 @@ object DownloadedIds {
 bash /tmp/ktool/run-recommendation-filter-tests.sh /tmp/vivi-reco
 ```
 
-Expected: `OK (16 tests)`, coverage lines for `RecommendationFilter` and `DownloadedIds`, all with zero missed lines.
+Expected: `OK (18 tests)`, coverage lines for `RecommendationFilter` and `DownloadedIds`, all with zero missed lines.
 
 - [ ] **Step 5: Commit**
 
@@ -715,8 +760,12 @@ Material3SettingsItem(icon = painterResource(...), title = { Text(...) },
 ActionPromptDialog(title: String? = null, onDismiss: () -> Unit, onConfirm: () -> Unit,
                    onReset: (() -> Unit)? = null, onCancel: (() -> Unit)? = null,
                    content: @Composable ColumnScope.() -> Unit = {})
-rememberPreference(key, defaultValue)  // returns Pair<T, (T) -> Unit>
+rememberPreference(key, defaultValue)  // destructured as val (value, setter) = ...
 ```
+
+Drawable availability, confirmed by running the check in Step 3: `home_outlined`, `explore_outlined` and
+`music_note` exist; `discover_outlined` and `remix_outlined` do not, so Step 2's third row uses `music_note`
+and its second row uses `explore_outlined`.
 
 - [ ] **Step 1: Write the strings**
 
@@ -1483,10 +1532,11 @@ and next to the matching test classes in `excludes`:
 
 ```bash
 cd /tmp/vivi-reco
-git diff app/build.gradle.kts | grep -c '^+'
+git diff app/build.gradle.kts | grep -c '^+[^+]'
 ```
 
-Expected: `4`.
+Expected: `4`. (Count `+` lines that are not the `+++ b/app/build.gradle.kts` header - a plain `'^+'` counts the header
+too and returns 5.)
 
 - [ ] **Step 3: Commit**
 
@@ -1659,3 +1709,164 @@ real proof that the hooks compile and that `koverVerify` passes.
   so a hand-edited preference cannot produce a 0-item or 10 000-item row.
 - Never pad a row with downloaded items. If filtering leaves fewer items than the target, the row is simply
   shorter.
+
+## Tech-debt pass (2026-09-26)
+
+Results of the mandated Common checks (no Python or Rust changed, so only the Common section ran):
+
+1. **Test overlap:** the sixteen new unit tests were reviewed for redundancy; the `resize` pair was removed
+   later, see item 3.
+2. **Coverage:** the changed pure Kotlin is at 100% line coverage (RecommendationFilter 16/16,
+   DownloadSnapshot 1/1, DownloadedIds 2/2, branches 14/14 before the removal), and CI's Kover gate of 95%
+   measures those classes because patch 02 adds `RecommendationFilter*` and `DownloadedIds*` to the filter.
+3. **Dead code (maintainer-approved):** `RecommendationFilter.resize` had no production call site - the hooks
+   call `.take()` on an already-clamped size and `pad` clamps internally - so it and its two tests were
+   deleted, and the spec's Pure API table no longer lists it. `RecommendationFilterTest` now holds 14 tests.
+4. **Docstring audit (subagent, 28 comments reviewed):** three stale comments of patch 02's own making were
+   corrected - `pad`'s "capped at `size`" became "capped at the clamped `size`";
+   `buildSeededCoversAndRemixes`'s "keeping songs that are not podcast-like" became "keeping only songs
+   shorter than ten minutes", because the method applies no type filter; and the Quick Picks seed comment's
+   "has not played recently" became "other than the most recent play". Nothing was stale in `DownloadedIds.kt`,
+   `LocalRecommendationPrefs.kt`, `LocalRecommendationSettings.kt` or `ContentSettings.kt`.
+5. **Recorded, not changed:** `buildSeededCoversAndRemixes` does not apply the PODCAST filter its sibling
+   `buildFallbackCoversAndRemixes` applies, so a podcast-typed result under ten minutes can reach the seeded
+   covers padding. That is a behaviour question for the review steps, not a doc fix, and was fixed in review
+   round 2: the seeded searches now apply the same PODCAST filter.
+   The same applies to two pre-existing upstream comments that read "always has something to show on launch"
+   and "Guarantees the UI shows real content before any network call": with every item in a section already
+   downloaded the section is empty by design (the spec says an empty section is not rendered), so those
+   absolutes are no longer true in that case. Upstream prose was left untouched to keep patch 02 small.
+6. **README:** patch 02's own section claimed "short hooks" for a 245-line change, and its named-debt list
+   predated patch 02; both corrected, and the measured-scope bullet now records the new classes' 100%.
+
+## Code review round 1 (2026-09-26)
+
+Reviewer A: BLOCK - 3 P1, 8 P2, notes. Reviewer B: OK with notes - 8 P2. Thirteen unique issues, all fixed:
+
+**P1:** (1) `getSongsByIds(emptyList())` ran on every refresh without downloads - Room expands it to `IN ()`,
+which SQLite rejects - now guarded by `downloadSeedIds.isNotEmpty()`; (2) padded local covers items bypassed
+`filterExplicit`/`filterYoutubeShorts`, so most of a 50-item row ignored those settings - the local half is
+filtered now; (3) the covers top-up ran up to four serial network searches before `homePage.value` published,
+delaying the whole feed - the filtered shelf is published immediately and the top-up runs in a launched
+coroutine.
+
+**P2:** (4) covers seeds were played-first so downloaded seeds never ran - downloads are the seeds now, with
+played ids filling the rest of the three-seed budget; (5) Daily Discover applied its cap before excluding
+played ids, so already-seeded downloads crowded out new ones - the played ids are passed into `seedIds`;
+(6) the dead `loadFallbackCoversAndRemixes` was deleted; (7) `loadMoreYouTubeItems` now applies
+`take(coversAndRemixesSize)`; (8) the Quick Picks per-seed lookups run concurrently instead of serially, and
+the generic covers search only runs when the seeded searches returned nothing; (9) the no-op artist filter
+(YouTube channel ids compared against video ids) was dropped, and both `keepSuggestible*` helpers short-circuit
+when nothing is downloaded instead of querying `albumSongs` per card on every refresh; (10) the README and this
+spec no longer claim playlist-card filtering, the spec's stepper wording, its "no other upstream file" claim and
+its 10-20 line sizing were corrected; (11) the signing suite clones into a staging directory and moves it into
+place, so an interrupted clone cannot poison the cache, and `UPSTREAM_TREE` lets a caller supply the tree;
+(12) `STATE_COMPLETED` is now aliased from patch 01's `MEDIA3_STATE_COMPLETED` rather than duplicated - patch 02
+therefore touches that fork-owned file, which the local harness now compiles too; (13) the settings dialog's
+state uses `rememberSaveable`.
+
+Notes also fixed: the test fixture labelled state 1 "failed" (Media3's STATE_FAILED is 4; 1 is STATE_STOPPED);
+the hint string no longer doubles as the field label and the field asks for a numeric keyboard; and the stray
+tracked file `et --hard 33c82f9` was removed from the fork.
+
+## Code review round 2 (2026-09-26)
+
+Both reviewers confirmed all thirteen round-1 fixes in the current code. Reviewer A: BLOCK - 1 P1, 5 P2.
+Reviewer B: OK with notes - 6 P2. Eight unique issues, all fixed:
+
+**P1:** the "Daily Discover items" setting could not change anything. That row makes one item per seed and
+was structurally capped at ten items (five liked/history/backend seeds plus at most five download seeds),
+while the setting's clamp floor is ten - so `take(dailyDiscoverSize)` was a no-op for every admissible
+value, contradicting the spec and README. The seed pool now scales with the setting
+(`seedBudget = maxOf(5, dailyDiscoverSize / 2)`).
+
+**P2:** (1) a covers top-up still running from an earlier load could overwrite a newer row - the top-up now
+captures a load generation and publishes only when its generation is still current and the scope is active,
+and `load()` bumps the generation; (2) `DownloadedIdsTest` still labelled Media3 state 1 as "failed" (it is
+`STATE_STOPPED`; failed is 4) - corrected, with a `"failed" to 4` entry; (3) nothing verified the restated
+Media3 number - a new test asserts `Download.STATE_COMPLETED == RecommendationFilter.STATE_COMPLETED`
+against real Media3 in CI (the local harness uses a stub for that one class); (4) the seeded covers searches
+dropped the PODCAST filter its fallback sibling keeps - applied there too; (5) the Media3 index read is now
+wrapped in `runCatching` with a log, as the spec promised; (6) the settings dialog names the section it
+edits, the unused `remember` import is gone, and the spec's Daily Discover seeding description, "stepper
+rows" wording, generic-search claim and this plan's file map were corrected.
+
+Recorded as report-only: innertube's `runCatching` swallows `CancellationException` one layer above the
+documented cancellation handling, so a cancelled scope's `awaitAll` returns empty pages rather than aborting
+(upstream pattern, not introduced here); the guard added to the top-up publish keeps that from writing after
+the view model is gone. The suite deliberately keeps using a stale cache when the network is down, so only a
+CI run proves current upstream drift.
+
+## Code review round 3 (2026-09-26)
+
+Reviewer A: BLOCK - 1 P0, 1 P1, 3 P2. Reviewer B: OK with notes - 3 P2. Six unique issues, all fixed:
+
+**P0 (introduced by the round-2 fix):** a bare `isActive` in the covers top-up needed
+`import kotlinx.coroutines.isActive`, which the file did not have - a compile breaker that the local syntax-only
+check could not see, because it greps for `expecting`/`unexpected token` and discards `unresolved reference`.
+The import is added, and the local check now runs `kotlinc` with the coroutines jar and diffs the unresolved
+names against a saved baseline, so a missing coroutines import cannot pass again. Android/Hilt/DataStore names
+stay unresolvable here: CI's compile remains the authority for those.
+
+**P1 (round-2 fix incomplete):** one item per seed meant `seedBudget = maxOf(5, size / 2)` bounded the row at
+`size / 2 + 5` items, so the setting still could not reach its own value. The budget is now the configured
+size, and the setting's hint text says that higher counts cost more lookups per refresh. Consequence, recorded
+rather than hidden: at the 200 maximum this row issues up to 200 lookups per refresh, upstream issues 5, and
+the innertube client has no limiter, so throttling shows up as a silently shorter row.
+
+**P2:** the generation guard read `loadGeneration` inside the launched coroutine, so a top-up starting after a
+newer load adopted that newer generation - the value is now passed down from `load()` and the field is
+`@Volatile`; five doc contradictions were corrected (the spec's Daily Discover seed description and its
+`DownloadedIds` mechanism, this plan's Kover line count and missing `DownloadRecovery.kt` row, and its stale
+"PODCAST filter was left alone" note), along with the Kover comment the patch extends, which now names patch
+02's classes. Reviewer B's third note is accepted as a residual: under the local harness the Media3
+cross-check test compares a hand-written stub with itself, so only CI's real Media3 makes it meaningful.
+
+## Code review round 4 (2026-09-26)
+
+Reviewer A: BLOCK - 1 P1, 6 P2. Reviewer B: OK - 3 P2. Ten unique issues, all fixed:
+
+**P1:** the round-3 fix made the Daily Discover seed budget equal the setting, so row items equalled network
+lookups - 10x upstream at the default 50 and 40x at the maximum 200 - on the same InnerTube client that
+resolves playback metadata, with `withRetry` tripling failures and no limiter in the module, and `load()` (and
+therefore pull-to-refresh) waiting for the whole burst. The fix decouples items from lookups: the played-seed budget
+is capped at 30 (`DAILY_DISCOVER_SEED_LOOKUPS`, with up to five downloaded seeds added on top = 35 lookups)
+and each seed contributes up to
+`ceil(size / seedBudget)` items from its already-fetched panel, so the row still reaches its configured size
+with at most 30 lookups.
+
+**P2:** the settings hint was rendered for all three rows but only Daily Discover scales its lookups with the
+size - it now reads "Higher counts can mean more network lookups"; `sectionSize`'s `runCatching` swallowed
+`CancellationException` around a suspending read - it rethrows; the shelf publish carried an unreachable
+`?: HomePage.Section(...)` branch (the items come from `cnrSection` and filtering never adds any) - replaced by
+an explicit null check; the album-membership lookups are now capped at `MAX_COLLECTION_CHECKS` (8) per row, so
+a refresh cannot issue one query per album card; `DownloadedIds.snapshots` had no caller outside its own file
+and is inlined; and the spec's two cost claims, its `DownloadedIds` mechanism description and its New-files
+table were corrected, with a README limitation row for the Daily Discover lookup cost and a note that a size
+change applies on the next refresh. Reviewer B's note about the plan's `et --hard 33c82f9` deletion is
+handled by staging that removal separately from the patch change.
+
+## Code review round 5 (final round, 2026-09-26)
+
+Reviewer A: OK with notes - 5 P2. Reviewer B: OK with notes - 4 P2 + a P3 nit. **No P0/P1.** Six unique
+issues, all fixed in this round:
+
+- The immediate shelf publish in the Covers & Remixes row is now generation-guarded like the top-up it feeds,
+  so a late result from an older load cannot overwrite a newer row with a shorter stale shelf.
+- `pad` no longer counts items the row never renders: both halves of the covers row are filtered to
+  `SongItem` (which is all `HomeScreen` shows), so the row reaches the configured size.
+- `keepSuggestibleAlbums` applies `MAX_COLLECTION_CHECKS` and the thumbnail filter runs before the checks, so
+  the Keep Listening row cannot spend queries on cards it drops and cannot grow query counts if upstream
+  raises its album limit.
+- The lookup bound is restated everywhere as up to 35 (30 played seeds plus five downloaded ones), the
+  "fetching stops as soon as a section reaches its target" sentence is corrected (fetches are bounded per
+  seed and the row is capped, not stopped early), the cost list now includes the Quick Picks download-seed
+  lookups, the `LocalRecommendationPrefs` row no longer claims to hold the defaults, and the album-check cap
+  (first eight cards per row) is disclosed in both the spec and the README. The README's Daily Discover
+  limitation row was retitled so it matches its own text.
+
+Residuals recorded, not fixed: the CI-only checks (Android compile, real-Media3 cross-check, Kover gate) are
+unverifiable on this machine; the `init` load versus pull-to-refresh overlap leaves the pre-existing
+last-writer-wins behaviour for Quick Picks, Daily Discover and Similar Recommendations (this patch narrows the
+window and guards its own row); the 200-card Daily Discover row's carousel virtualisation was not verified;
+and the local Media3 cross-check test compares a hand-written stub with itself by construction.

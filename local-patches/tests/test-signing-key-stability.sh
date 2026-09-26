@@ -12,6 +12,9 @@
 # The pinned keystore is not created here; it is supplied by the fork owner (see README). While it is
 # absent the suite reports PENDING for the one check that needs it, and the CI build fails loudly,
 # because apply.sh refuses to patch a tree without it.
+#
+# The trees this suite patches come from current upstream main (cached under ${TMPDIR:-/tmp}), because
+# the patch set targets upstream, not this fork's own older source snapshot.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,6 +23,8 @@ readonly PATCH_DIR="${REPO_ROOT}/local-patches"
 readonly WORKFLOW="${REPO_ROOT}/.github/workflows/local-build.yml"
 readonly PIN_FILE="${PATCH_DIR}/signing-cert.sha256"
 readonly WORK_DIR="${TMPDIR:-/tmp}/vivi-signing-key-stability"
+readonly UPSTREAM_URL="https://github.com/vivizzz007/vivi-music"
+UPSTREAM_CACHE="${TMPDIR:-/tmp}/vivi-upstream-main"
 readonly FIXTURE_KEYSTORE="test fixture, deliberately not a keystore"
 
 PASSED=0
@@ -30,10 +35,56 @@ ok() { printf 'PASS     %s\n' "$1"; PASSED=$((PASSED + 1)); }
 not_ok() { printf 'FAIL     %s\n' "$1"; FAILED=$((FAILED + 1)); }
 pending() { printf 'PENDING  %s\n' "$1"; PENDING=$((PENDING + 1)); }
 
+# The patch set is built against current upstream main, not this fork's committed source snapshot, so the
+# trees under test must come from upstream. A shallow clone is cached between runs; a refresh that cannot
+# reach the network keeps using the cache, so an offline run still works once the cache exists. With no
+# cache and no network there is nothing trustworthy to test, so the suite fails loudly instead of falling
+# back to the fork's snapshot.
+prepare_upstream() {
+  # UPSTREAM_TREE lets a caller (CI, or a developer with a pristine checkout) supply the tree directly;
+  # otherwise a shallow clone is cached between runs.
+  if [[ -n "${UPSTREAM_TREE:-}" ]]; then
+    if [[ ! -d "${UPSTREAM_TREE}/.git" ]]; then
+      echo "FAIL     UPSTREAM_TREE=${UPSTREAM_TREE} is not a git checkout of upstream main." >&2
+      exit 1
+    fi
+    UPSTREAM_CACHE="${UPSTREAM_TREE}"
+    echo "UPSTREAM testing against ${UPSTREAM_CACHE} @$(git -C "${UPSTREAM_CACHE}" rev-parse --short HEAD) (supplied tree)"
+    return 0
+  fi
+
+  if [[ -d "${UPSTREAM_CACHE}/.git" ]]; then
+    if ! {
+      git -C "${UPSTREAM_CACHE}" fetch --depth 1 --quiet origin main &&
+        git -C "${UPSTREAM_CACHE}" reset --quiet --hard FETCH_HEAD
+    }; then
+      echo "NOTE     could not refresh ${UPSTREAM_CACHE}; testing the cached tree as it is" >&2
+    fi
+  else
+    # Clone into a staging directory and move it into place: an interrupted clone must never leave a
+    # half-populated cache behind that makes every later run fail.
+    local staging
+    staging="$(mktemp -d "${UPSTREAM_CACHE}.XXXXXX")"
+    if ! git clone --depth 1 --quiet "${UPSTREAM_URL}" "${staging}/repo"; then
+      rm -rf "${staging}"
+      echo "FAIL     cannot materialize upstream main: cloning ${UPSTREAM_URL} failed." >&2
+      echo "         This suite must test the real patch base (current upstream main), never this fork's" >&2
+      echo "         stale source snapshot - reconnect, or seed the cache, or pass UPSTREAM_TREE." >&2
+      exit 1
+    fi
+    rm -rf "${UPSTREAM_CACHE}"
+    mv "${staging}/repo" "${UPSTREAM_CACHE}"
+    rmdir "${staging}" 2>/dev/null || true
+  fi
+
+  echo "UPSTREAM testing against $(git -C "${UPSTREAM_CACHE}" config --get remote.origin.url)" \
+    "@$(git -C "${UPSTREAM_CACHE}" rev-parse --short HEAD) (cached at ${UPSTREAM_CACHE})"
+}
+
 new_tree() {
   local target="$1"
   mkdir -p "${target}"
-  git -C "${REPO_ROOT}" archive HEAD | tar -x -C "${target}"
+  git -C "${UPSTREAM_CACHE}" archive HEAD | tar -x -C "${target}"
   git -C "${target}" init -q
 }
 
@@ -75,6 +126,9 @@ readonly FIXTURE_WITHOUT="${WORK_DIR}/fixture-without-keystore"
 readonly TREE_ONE="${WORK_DIR}/tree-one"
 readonly TREE_TWO="${WORK_DIR}/tree-two"
 readonly TREE_CHECK="${WORK_DIR}/tree-check"
+
+# The trees under test come from upstream main, never this fork's committed snapshot: see prepare_upstream.
+prepare_upstream
 
 new_fixture "${FIXTURE_WITH}" yes
 new_fixture "${FIXTURE_WITHOUT}" no

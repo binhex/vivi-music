@@ -1,0 +1,1161 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index a8734160..97dba3fb 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -332,7 +332,7 @@ dependencies {
+ }
+ 
+ // Coverage gate for the JVM-testable code. The scope is the pure rules - the folder and file-name
+-// templates, the album-artist rule and the download stall/retry policy: the rest of this patch depends on
++// templates, the album-artist rule and the download stall/retry policy from patch 01, plus the recommendation filter and its download-state mapper from patch 02: the rest of this patch depends on
+ // Android, Hilt, Media3 or Compose and would need Robolectric or a device. That excluded debt is recorded in
+ // the fork README, not here.
+ kover {
+@@ -342,6 +342,8 @@ kover {
+                 classes("com.music.vivi.playback.DownloadFormat*")
+                 classes("com.music.vivi.playback.AlbumArtist*")
+                 classes("com.music.vivi.playback.DownloadRecovery*")
++                classes("com.music.vivi.playback.RecommendationFilter*")
++                classes("com.music.vivi.playback.DownloadedIds*")
+             }
+             excludes {
+                 // The wildcard above also matches the test class; test code is fully covered and must not
+@@ -349,6 +351,8 @@ kover {
+                 classes("com.music.vivi.playback.DownloadFormatTest")
+                 classes("com.music.vivi.playback.AlbumArtistTest")
+                 classes("com.music.vivi.playback.DownloadRecoveryTest")
++                classes("com.music.vivi.playback.RecommendationFilterTest")
++                classes("com.music.vivi.playback.DownloadedIdsTest")
+             }
+         }
+         verify {
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
+index 10fcadf6..910d238b 100644
+--- a/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
++++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
+@@ -62,7 +62,7 @@ internal data class DownloadRecoveryObservation(
+ private const val MEDIA3_STATE_QUEUED = 0
+ private const val MEDIA3_STATE_STOPPED = 1
+ private const val MEDIA3_STATE_DOWNLOADING = 2
+-private const val MEDIA3_STATE_COMPLETED = 3
++const val MEDIA3_STATE_COMPLETED = 3
+ private const val MEDIA3_STATE_FAILED = 4
+ private const val MEDIA3_STATE_REMOVING = 5
+ private const val MEDIA3_STATE_RESTARTING = 7
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt
+new file mode 100644
+index 00000000..25b50dea
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt
+@@ -0,0 +1,23 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++/**
++ * Bridges Media3's download index to the pure [RecommendationFilter].
++ *
++ * [DownloadUtil] is a `@Singleton` whose `downloads` flow is a `Map<String, Download>` keyed by the
++ * download request id, which is the YouTube video id - the same id every home-screen item carries.
++ * HomeViewModel reduces that map to `Map<String, Int>` (id to state) in one line, which keeps Media3
++ * types out of this file and out of the unit tests.
++ */
++object DownloadedIds {
++
++    /** Ids of downloads that finished, ready to hand to the filter. */
++    fun completed(states: Map<String, Int>): Set<String> =
++        RecommendationFilter.completedIds(
++            states.map { (id, state) -> RecommendationFilter.DownloadSnapshot(id, state) },
++        )
++}
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt b/app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt
+new file mode 100644
+index 00000000..7e4c6c58
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt
+@@ -0,0 +1,22 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import androidx.datastore.preferences.core.intPreferencesKey
++
++/**
++ * Preferences owned by the "hide downloads and show more per section" patch.
++ *
++ * Kept out of `constants/PreferenceKeys.kt` for the same reason as [LocalDownloadPrefs]: that file is
++ * touched by nearly every upstream release, and an added line there is the likeliest thing to stop this
++ * patch from applying. Defaults live in [RecommendationFilter] so the settings rows and the view model
++ * cannot disagree about them.
++ */
++val QuickPicksSizeKey = intPreferencesKey("localRecommendation.quickPicksSize")
++
++val DailyDiscoverSizeKey = intPreferencesKey("localRecommendation.dailyDiscoverSize")
++
++val CoversAndRemixesSizeKey = intPreferencesKey("localRecommendation.coversAndRemixesSize")
+diff --git a/app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt b/app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt
+new file mode 100644
+index 00000000..f169acc9
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt
+@@ -0,0 +1,89 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++/**
++ * Pure rules behind the "hide what I already downloaded, show more per section" patch.
++ *
++ * Nothing here touches Android, Media3 or Compose on purpose: this is the part of the feature that runs
++ * on any JVM, so it is fully unit-tested and measured by CI's Kover gate. The one Android touch - reading
++ * Media3's download state - happens in HomeViewModel and is mapped into [DownloadSnapshot] by
++ * [DownloadedIds].
++ */
++object RecommendationFilter {
++    /** Smallest and largest number of items a section may be configured to show. */
++    const val MIN_SECTION_SIZE = 10
++    const val MAX_SECTION_SIZE = 200
++
++    /** Item count every configurable section uses until the user changes it. */
++    const val DEFAULT_SECTION_SIZE = 50
++
++    /** How many downloaded songs may be added on top of the existing seeds. */
++    const val MAX_DOWNLOAD_SEEDS = 5
++
++    /**
++     * Media3's Download.STATE_COMPLETED, aliased from [MEDIA3_STATE_COMPLETED] so the fork keeps a single
++     * copy of the number: if Media3 ever renumbers it, one edit moves both users, and CI's Android unit
++     * tests are where the real value is exercised.
++     */
++    const val STATE_COMPLETED = MEDIA3_STATE_COMPLETED
++
++    /** One download as the adapter sees it: the item id and Media3's state code. */
++    data class DownloadSnapshot(val id: String, val state: Int)
++
++    /** Clamp a configured section size into the supported range. */
++    fun clampSize(value: Int): Int = value.coerceIn(MIN_SECTION_SIZE, MAX_SECTION_SIZE)
++
++    /** Ids of downloads that finished. Queued, running and failed downloads are not "downloaded". */
++    fun completedIds(snapshots: List<DownloadSnapshot>): Set<String> =
++        snapshots.filter { it.state == STATE_COMPLETED }.map { it.id }.toSet()
++
++    /**
++     * Whether a collection (album or playlist) may still be suggested.
++     *
++     * A collection is hidden only when it has tracks and every one of them is downloaded. An empty track
++     * list means membership could not be determined, so the collection is kept rather than hidden.
++     */
++    fun keepCollection(trackIds: List<String>, downloadedIds: Set<String>): Boolean =
++        trackIds.isEmpty() || trackIds.any { it !in downloadedIds }
++
++    /**
++     * Seeds for the recommendation lookups: the existing play-history seeds unchanged, then downloaded
++     * songs that are not already among them, at most `maxDownloaded` of them.
++     */
++    fun seedIds(playedSeeds: List<String>, downloadedSongs: List<String>, maxDownloaded: Int): List<String> {
++        val extra = downloadedSongs
++            .filterNot { it in playedSeeds }
++            .distinct()
++            .take(maxDownloaded.coerceAtLeast(0))
++        return playedSeeds + extra
++    }
++
++    /**
++     * Remote items first, then local items, both filtered and de-duplicated by id, capped at the clamped `size`.
++     * Used to grow the Covers & Remixes row past whatever the server shelf returned.
++     */
++    fun <T> pad(
++        remote: List<T>,
++        local: List<T>,
++        size: Int,
++        downloadedIds: Set<String>,
++        idOf: (T) -> String,
++    ): List<T> {
++        val limit = clampSize(size)
++        val seen = LinkedHashSet<String>()
++        val result = mutableListOf<T>()
++        for (item in keepUndownloaded(remote, downloadedIds, idOf) + keepUndownloaded(local, downloadedIds, idOf)) {
++            if (seen.add(idOf(item))) result.add(item)
++            if (result.size == limit) break
++        }
++        return result
++    }
++
++    /** Drop items whose id is already downloaded, keeping the original order. */
++    fun <T> keepUndownloaded(items: List<T>, downloadedIds: Set<String>, idOf: (T) -> String): List<T> =
++        items.filterNot { idOf(it) in downloadedIds }
++}
+diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt
+index cecfd1cb..c160b598 100644
+--- a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt
++++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt
+@@ -1271,6 +1271,7 @@ fun ContentSettings(
+             )
+         )
+ 
++        LocalRecommendationSettingsGroup()
+         Spacer(modifier = Modifier.height(27.dp))
+ 
+         ExpressiveSettingGroup(
+diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt
+new file mode 100644
+index 00000000..e07343ad
+--- /dev/null
++++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt
+@@ -0,0 +1,126 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++package com.music.vivi.ui.screens.settings
++
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.res.painterResource
++import androidx.compose.ui.res.stringResource
++import com.music.vivi.R
++import com.music.vivi.playback.CoversAndRemixesSizeKey
++import com.music.vivi.playback.DailyDiscoverSizeKey
++import com.music.vivi.playback.QuickPicksSizeKey
++import com.music.vivi.playback.RecommendationFilter
++import com.music.vivi.ui.component.ActionPromptDialog
++import com.music.vivi.ui.component.ExpressiveSettingGroup
++import com.music.vivi.ui.component.Material3SettingsItem
++import com.music.vivi.utils.rememberPreference
++
++/** Which of the three sizes the number dialog is currently editing. */
++private enum class RecommendationSizeField { QUICK_PICKS, DAILY_DISCOVER, COVERS_AND_REMIXES }
++
++/**
++ * Settings rows for the "hide downloads and show more per section" patch.
++ *
++ * The group is called from upstream ContentSettings.kt with a single line, so the patch touches as little
++ * upstream code as possible.
++ */
++@Composable
++fun LocalRecommendationSettingsGroup() {
++    val (quickPicksSize, onQuickPicksSizeChange) =
++        rememberPreference(QuickPicksSizeKey, RecommendationFilter.DEFAULT_SECTION_SIZE)
++    val (dailyDiscoverSize, onDailyDiscoverSizeChange) =
++        rememberPreference(DailyDiscoverSizeKey, RecommendationFilter.DEFAULT_SECTION_SIZE)
++    val (coversAndRemixesSize, onCoversAndRemixesSizeChange) =
++        rememberPreference(CoversAndRemixesSizeKey, RecommendationFilter.DEFAULT_SECTION_SIZE)
++
++    var editing by rememberSaveable { mutableStateOf<RecommendationSizeField?>(null) }
++    var draft by rememberSaveable { mutableStateOf("") }
++
++    fun open(field: RecommendationSizeField, current: Int) {
++        editing = field
++        draft = current.toString()
++    }
++
++    /** Returns the parsed size, or null when the text is not a number inside the supported range. */
++    fun parsed(text: String): Int? {
++        val value = text.trim().toIntOrNull() ?: return null
++        return value.takeIf { it in RecommendationFilter.MIN_SECTION_SIZE..RecommendationFilter.MAX_SECTION_SIZE }
++    }
++
++    ExpressiveSettingGroup(
++        title = stringResource(R.string.recommendations),
++        items = listOf(
++            Material3SettingsItem(
++                icon = painterResource(R.drawable.home_outlined),
++                title = { Text(stringResource(R.string.recommendations_quick_picks_items)) },
++                trailingContent = { Text(quickPicksSize.toString()) },
++                onClick = { open(RecommendationSizeField.QUICK_PICKS, quickPicksSize) },
++            ),
++            Material3SettingsItem(
++                icon = painterResource(R.drawable.explore_outlined),
++                title = { Text(stringResource(R.string.recommendations_daily_discover_items)) },
++                trailingContent = { Text(dailyDiscoverSize.toString()) },
++                onClick = { open(RecommendationSizeField.DAILY_DISCOVER, dailyDiscoverSize) },
++            ),
++            Material3SettingsItem(
++                icon = painterResource(R.drawable.music_note),
++                title = { Text(stringResource(R.string.recommendations_covers_and_remixes_items)) },
++                trailingContent = { Text(coversAndRemixesSize.toString()) },
++                onClick = { open(RecommendationSizeField.COVERS_AND_REMIXES, coversAndRemixesSize) },
++            ),
++        ),
++    )
++
++    val field = editing
++    if (field != null) {
++        ActionPromptDialog(
++            title = when (field) {
++                RecommendationSizeField.QUICK_PICKS -> stringResource(R.string.recommendations_quick_picks_items)
++                RecommendationSizeField.DAILY_DISCOVER -> stringResource(R.string.recommendations_daily_discover_items)
++                RecommendationSizeField.COVERS_AND_REMIXES -> stringResource(R.string.recommendations_covers_and_remixes_items)
++            },
++            onDismiss = { editing = null },
++            onConfirm = {
++                val value = parsed(draft)
++                if (value != null) {
++                    when (field) {
++                        RecommendationSizeField.QUICK_PICKS -> onQuickPicksSizeChange(value)
++                        RecommendationSizeField.DAILY_DISCOVER -> onDailyDiscoverSizeChange(value)
++                        RecommendationSizeField.COVERS_AND_REMIXES -> onCoversAndRemixesSizeChange(value)
++                    }
++                    editing = null
++                }
++            },
++            onReset = { draft = RecommendationFilter.DEFAULT_SECTION_SIZE.toString() },
++            onCancel = { editing = null },
++        ) {
++            Column {
++                OutlinedTextField(
++                    value = draft,
++                    onValueChange = { draft = it },
++                    label = { Text(stringResource(R.string.recommendations)) },
++                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++                    isError = parsed(draft) == null,
++                    supportingText = {
++                        if (parsed(draft) == null) {
++                            Text(stringResource(R.string.recommendations_items_invalid))
++                        } else {
++                            Text(stringResource(R.string.recommendations_items_hint))
++                        }
++                    },
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt b/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt
+index 5f9fc67a..2b80e7c1 100644
+--- a/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt
++++ b/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt
+@@ -6,6 +6,7 @@
+ package com.music.vivi.viewmodels
+ 
+ import android.content.Context
++import androidx.datastore.preferences.core.Preferences
+ import androidx.datastore.preferences.core.edit
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.viewModelScope
+@@ -41,6 +42,12 @@ import com.music.vivi.db.entities.SpeedDialItem
+ import com.music.vivi.extensions.filterVideoSongs
+ import com.music.vivi.extensions.toEnum
+ import com.music.vivi.models.SimilarRecommendation
++import com.music.vivi.playback.CoversAndRemixesSizeKey
++import com.music.vivi.playback.DailyDiscoverSizeKey
++import com.music.vivi.playback.DownloadUtil
++import com.music.vivi.playback.DownloadedIds
++import com.music.vivi.playback.QuickPicksSizeKey
++import com.music.vivi.playback.RecommendationFilter
+ import com.music.vivi.ui.screens.wrapped.WrappedAudioService
+ import com.music.vivi.ui.screens.wrapped.WrappedManager
+ import com.music.vivi.utils.SyncUtils
+@@ -60,11 +67,20 @@ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+ import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.launch
+ import java.time.LocalDate
+ import javax.inject.Inject
+ import kotlin.random.Random
+ 
++/** Cap on the played-seed lookups for Daily Discover; up to MAX_DOWNLOAD_SEEDS downloaded seeds are added
++ * on top of it, so the row issues at most 35 one-shot InnerTube lookups per refresh. */
++private const val DAILY_DISCOVER_SEED_LOOKUPS = 30
++
++/** Bounds the album-membership lookups per row so a refresh cannot issue one query per album card. */
++private const val MAX_COLLECTION_CHECKS = 8
++
+ data class DailyDiscoverItem(
+     val seed: Song,
+     val recommendation: YTItem,
+@@ -83,6 +99,7 @@ class HomeViewModel @Inject constructor(
+     val syncUtils: SyncUtils,
+     val wrappedManager: WrappedManager,
+     private val wrappedAudioService: WrappedAudioService,
++    private val downloadUtil: DownloadUtil,
+ ) : ViewModel() {
+     val isRefreshing = MutableStateFlow(false)
+     val isLoading = MutableStateFlow(false)
+@@ -105,6 +122,60 @@ class HomeViewModel @Inject constructor(
+     val selectedChip = MutableStateFlow<HomePage.Chip?>(null)
+     private val previousHomePage = MutableStateFlow<HomePage?>(null)
+ 
++    private var quickPicksSize = RecommendationFilter.DEFAULT_SECTION_SIZE
++    private var dailyDiscoverSize = RecommendationFilter.DEFAULT_SECTION_SIZE
++    private var coversAndRemixesSize = RecommendationFilter.DEFAULT_SECTION_SIZE
++    private var downloadedIds: Set<String> = emptySet()
++
++    /** Bumped by every load(); a background top-up only publishes while its own generation is current. */
++    @Volatile
++    private var loadGeneration = 0
++
++    /** Configured section size, clamped, falling back to the default when DataStore cannot be read. */
++    private suspend fun sectionSize(key: Preferences.Key<Int>): Int =
++        runCatching { context.dataStore.get(key, RecommendationFilter.DEFAULT_SECTION_SIZE) }
++            .getOrElse { error ->
++                // runCatching would also catch a CancellationException and turn it into the default; that
++                // must never be swallowed, even though the read it wraps is not suspending today.
++                if (error is CancellationException) throw error
++                RecommendationFilter.DEFAULT_SECTION_SIZE
++            }
++            .let { RecommendationFilter.clampSize(it) }
++
++    /** Drops downloaded songs, and album cards whose every track is already downloaded. */
++    private suspend fun keepSuggestible(items: List<YTItem>, downloaded: Set<String>): List<YTItem> {
++        if (downloaded.isEmpty()) return items
++        val kept = mutableListOf<YTItem>()
++        var collectionChecks = 0
++        for (item in items) {
++            if (item.id in downloaded) continue
++            if (item is AlbumItem && collectionChecks < MAX_COLLECTION_CHECKS) {
++                collectionChecks++
++                val trackIds = database.albumSongs(item.id).first().map { it.id }
++                if (!RecommendationFilter.keepCollection(trackIds, downloaded)) continue
++            }
++            kept.add(item)
++        }
++        return kept
++    }
++
++    /** [keepSuggestible] for the database-backed album cards of the Keep Listening row. */
++    private suspend fun keepSuggestibleAlbums(items: List<Album>, downloaded: Set<String>): List<Album> {
++        if (downloaded.isEmpty()) return items
++        val kept = mutableListOf<Album>()
++        var collectionChecks = 0
++        for (item in items) {
++            if (item.id in downloaded) continue
++            if (collectionChecks < MAX_COLLECTION_CHECKS) {
++                collectionChecks++
++                val trackIds = database.albumSongs(item.id).first().map { it.id }
++                if (!RecommendationFilter.keepCollection(trackIds, downloaded)) continue
++            }
++            kept.add(item)
++        }
++        return kept
++    }
++
+     val allLocalItems = MutableStateFlow<List<LocalItem>>(emptyList())
+     val allYtItems = MutableStateFlow<List<YTItem>>(emptyList())
+ 
+@@ -290,13 +361,20 @@ class HomeViewModel @Inject constructor(
+         android.util.Log.d("DailyDiscover", "getDailyDiscover started")
+         val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
+         val likedSongs = database.likedSongsByCreateDateAsc().first()
+-        
+-        var seeds = likedSongs.shuffled().distinctBy { it.id }.take(5)
++
++        // Seeds are the expensive part: one InnerTube call each, on the same client playback metadata
++        // resolution uses, so cap the played lookups at DAILY_DISCOVER_SEED_LOOKUPS (up to five downloaded
++        // seeds are added after this, so at most 35 lookups) and take several items from each seed's
++        // already-fetched panel instead of one per item. The hint warns that higher counts can cost more.
++        val seedBudget = minOf(dailyDiscoverSize, DAILY_DISCOVER_SEED_LOOKUPS)
++        val itemsPerSeed = (dailyDiscoverSize + seedBudget - 1) / seedBudget
++
++        var seeds = likedSongs.shuffled().distinctBy { it.id }.take(seedBudget)
+         android.util.Log.d("DailyDiscover", "Liked seeds count: ${seeds.size}")
+         
+         if (seeds.isEmpty()) {
+             // First fallback: Recent listening history
+-            seeds = database.events().first().map { it.song }.shuffled().distinctBy { it.id }.take(5)
++            seeds = database.events().first().map { it.song }.shuffled().distinctBy { it.id }.take(seedBudget)
+             android.util.Log.d("DailyDiscover", "History seeds count: ${seeds.size}")
+         }
+ 
+@@ -307,7 +385,7 @@ class HomeViewModel @Inject constructor(
+             com.music.innertube.YouTube.searchSummary("top songs").onSuccess { result ->
+                 val songs = result.summaries.flatMap { it.items }.filterIsInstance<com.music.innertube.models.SongItem>()
+                 android.util.Log.d("DailyDiscover", "Backend search returned ${songs.size} SongItems")
+-                songs.filter { !hideVideoSongs || !it.isVideoSong }.shuffled().take(5).forEach { song ->
++                songs.filter { !hideVideoSongs || !it.isVideoSong }.shuffled().take(seedBudget).forEach { song ->
+                     fallbackSeeds.add(
+                         Song(
+                             song = com.music.vivi.db.entities.SongEntity(
+@@ -327,6 +405,23 @@ class HomeViewModel @Inject constructor(
+             android.util.Log.d("DailyDiscover", "Final fallback seeds count: ${seeds.size}")
+         }
+ 
++        // Add downloaded songs that are not already seeds, so a downloaded-but-unplayed track also drives
++        // the mix. Bounded by RecommendationFilter.MAX_DOWNLOAD_SEEDS.
++        val playedSeedIds = seeds.map { it.id }
++        // Played ids are passed in so the cap applies to seeds that are genuinely new, not to downloads
++        // that already sit among the liked or history seeds.
++        val downloadedSeedIds = RecommendationFilter
++            .seedIds(
++                playedSeeds = playedSeedIds,
++                downloadedSongs = downloadedIds.toList(),
++                maxDownloaded = RecommendationFilter.MAX_DOWNLOAD_SEEDS,
++            )
++            .filterNot { it in playedSeedIds }
++        if (downloadedSeedIds.isNotEmpty()) {
++            val extraSeeds = database.getSongsByIds(downloadedSeedIds)
++            seeds = (seeds + extraSeeds).distinctBy { it.id }
++        }
++
+         if (seeds.isEmpty()) {
+             android.util.Log.e("DailyDiscover", "All seed sources empty, aborting")
+             return // Last resort fail safe
+@@ -348,12 +443,11 @@ class HomeViewModel @Inject constructor(
+                             }
+                             .shuffled()
+ 
+-                        // Simple check to avoid immediate duplicate of seed
+-                        val recommendation = recommendations.firstOrNull { rec ->
+-                            rec.id != seed.id
+-                        }
+-
+-                        if (recommendation != null) {
++                        // One panel, several items: the row reaches its configured size without one call per item.
++                        val chosen = recommendations
++                            .filterNot { rec -> rec.id == seed.id }
++                            .take(itemsPerSeed)
++                        for (recommendation in chosen) {
+                             items.add(
+                                 DailyDiscoverItem(
+                                     seed = seed,
+@@ -369,7 +463,11 @@ class HomeViewModel @Inject constructor(
+             }.forEach { it.join() }
+         }
+ 
+-        val finalizedItems = items.toList().distinctBy { it.recommendation.id }.shuffled()
++        val finalizedItems = RecommendationFilter
++            .keepUndownloaded(items.toList(), downloadedIds) { it.recommendation.id }
++            .distinctBy { it.recommendation.id }
++            .shuffled()
++            .take(dailyDiscoverSize)
+         android.util.Log.d("DailyDiscover", "Finalized dailyDiscover items size: ${finalizedItems.size}")
+         dailyDiscover.value = finalizedItems
+     }
+@@ -388,26 +486,34 @@ class HomeViewModel @Inject constructor(
+         when (quickPicksEnum.first()) {
+             QuickPicks.QUICK_PICKS -> {
+                 val tRelated = System.currentTimeMillis()
+-                val relatedSongs = database.quickPicks().first().filterVideoSongs(hideVideoSongs)
++                val relatedSongs = RecommendationFilter
++                    .keepUndownloaded(database.quickPicks().first(), downloadedIds) { it.id }
++                    .filterVideoSongs(hideVideoSongs)
+                 android.util.Log.d("QP_TIMING", "[Phase1] quickPicks DB query: ${System.currentTimeMillis() - tRelated}ms | count=${relatedSongs.size}")
+ 
+                 val tForgotten = System.currentTimeMillis()
+-                val forgotten = database.forgottenFavorites().first().filterVideoSongs(hideVideoSongs).take(8)
++                val forgotten = RecommendationFilter
++                    .keepUndownloaded(database.forgottenFavorites().first(), downloadedIds) { it.id }
++                    .filterVideoSongs(hideVideoSongs)
++                    .take(8)
+                 android.util.Log.d("QP_TIMING", "[Phase1] forgottenFavorites DB query: ${System.currentTimeMillis() - tForgotten}ms | count=${forgotten.size}")
+ 
+                 // Only local sources — no network calls here
+                 var combined = (relatedSongs + forgotten)
+                     .distinctBy { it.id }
+                     .shuffled()
+-                    .take(20)
++                    .take(quickPicksSize)
+ 
+                 // ── Fallback Tier 1: liked songs ──────────────────────────────────────
+                 // quickPicks uses related_song_map which is empty until songs are played
+                 // via the related pipeline. Fall back to liked songs for new/fresh users.
+                 if (combined.isEmpty()) {
+                     val tLiked = System.currentTimeMillis()
+-                    val likedSongs = database.likedSongsByCreateDateAsc().first()
+-                        .filterVideoSongs(hideVideoSongs).shuffled().take(20)
++                    val likedSongs = RecommendationFilter
++                        .keepUndownloaded(database.likedSongsByCreateDateAsc().first(), downloadedIds) { it.id }
++                        .filterVideoSongs(hideVideoSongs)
++                        .shuffled()
++                        .take(quickPicksSize)
+                     android.util.Log.d("QP_TIMING", "[Phase1][FALLBACK-1] liked songs: ${System.currentTimeMillis() - tLiked}ms | count=${likedSongs.size}")
+                     combined = likedSongs
+                 }
+@@ -417,8 +523,11 @@ class HomeViewModel @Inject constructor(
+                 if (combined.isEmpty()) {
+                     val tPlayed = System.currentTimeMillis()
+                     val fromTimeStamp = System.currentTimeMillis() - 86400000L * 365 // past year
+-                    val mostPlayed = database.mostPlayedSongs(fromTimeStamp, limit = 20).first()
+-                        .filterVideoSongs(hideVideoSongs).shuffled().take(20)
++                    val mostPlayed = RecommendationFilter
++                        .keepUndownloaded(database.mostPlayedSongs(fromTimeStamp, limit = 20).first(), downloadedIds) { it.id }
++                        .filterVideoSongs(hideVideoSongs)
++                        .shuffled()
++                        .take(quickPicksSize)
+                     android.util.Log.d("QP_TIMING", "[Phase1][FALLBACK-2] mostPlayed songs: ${System.currentTimeMillis() - tPlayed}ms | count=${mostPlayed.size}")
+                     combined = mostPlayed
+                 }
+@@ -427,15 +536,23 @@ class HomeViewModel @Inject constructor(
+                 // Last resort — at minimum show something from the library.
+                 if (combined.isEmpty()) {
+                     val tLib = System.currentTimeMillis()
+-                    val librarySongs = database.songsByCreateDateAsc().first()
+-                        .filterVideoSongs(hideVideoSongs).shuffled().take(20)
++                    val librarySongs = RecommendationFilter
++                        .keepUndownloaded(database.songsByCreateDateAsc().first(), downloadedIds) { it.id }
++                        .filterVideoSongs(hideVideoSongs)
++                        .shuffled()
++                        .take(quickPicksSize)
+                     android.util.Log.d("QP_TIMING", "[Phase1][FALLBACK-3] library songs: ${System.currentTimeMillis() - tLib}ms | count=${librarySongs.size}")
+                     combined = librarySongs
+                 }
+ 
+                 android.util.Log.d("QP_TIMING", "[Phase1] final source for combined: ${combined.size} songs")
+ 
+-                quickPicks.value = combined.ifEmpty { relatedSongs.shuffled().take(20) }
++                quickPicks.value = combined.ifEmpty {
++                    RecommendationFilter
++                        .keepUndownloaded(relatedSongs, downloadedIds) { it.id }
++                        .shuffled()
++                        .take(quickPicksSize)
++                }
+                 android.util.Log.d("QP_TIMING", "[Phase1] quickPicks.value SET with ${quickPicks.value?.size} items — total elapsed ${System.currentTimeMillis() - t0}ms")
+             }
+             QuickPicks.LAST_LISTEN -> {
+@@ -445,7 +562,11 @@ class HomeViewModel @Inject constructor(
+ 
+                 if (song != null && database.hasRelatedSongs(song.id)) {
+                     val tRelated = System.currentTimeMillis()
+-                    quickPicks.value = database.getRelatedSongs(song.id).first().filterVideoSongs(hideVideoSongs).shuffled().take(20)
++                    quickPicks.value = RecommendationFilter
++                        .keepUndownloaded(database.getRelatedSongs(song.id).first(), downloadedIds) { it.id }
++                        .filterVideoSongs(hideVideoSongs)
++                        .shuffled()
++                        .take(quickPicksSize)
+                     android.util.Log.d("QP_TIMING", "[Phase1][LAST_LISTEN] relatedSongs query: ${System.currentTimeMillis() - tRelated}ms | count=${quickPicks.value?.size}")
+                 } else {
+                     android.util.Log.w("QP_TIMING", "[Phase1][LAST_LISTEN] no related songs found for song=${song?.id} — quickPicks stays null")
+@@ -500,13 +621,51 @@ class HomeViewModel @Inject constructor(
+             android.util.Log.e("QP_TIMING", "[Phase2] YouTube.related() FAILED after ${System.currentTimeMillis() - tRelated}ms", it)
+         }
+ 
+-        if (ytSimilarSongs.isNotEmpty()) {
++        // Downloaded songs other than the most recent play are a strong signal too: pull their
++        // related songs as extra candidates. seedIds bounds this to MAX_DOWNLOAD_SEEDS ids BEFORE the
++        // database lookup, which keeps the SQL IN list small.
++        val downloadSeedIds = RecommendationFilter
++            .seedIds(
++                playedSeeds = listOfNotNull(recentSong?.id),
++                downloadedSongs = downloadedIds.toList(),
++                maxDownloaded = RecommendationFilter.MAX_DOWNLOAD_SEEDS,
++            )
++            .filterNot { it == recentSong?.id }
++        // An empty id list must never reach the DAO: Room expands it to IN () and SQLite rejects that.
++        // The per-seed lookups are independent, so they run concurrently - serially this was two network
++        // round-trips per seed on the cold-load path.
++        val ytDownloadRelated = mutableListOf<Song>()
++        if (downloadSeedIds.isNotEmpty()) {
++            val downloadSeeds = database.getSongsByIds(downloadSeedIds)
++            val relatedPages = coroutineScope {
++                downloadSeeds.map { seed ->
++                    async(Dispatchers.IO) {
++                        YouTube.next(WatchEndpoint(videoId = seed.id)).getOrNull()
++                            ?.relatedEndpoint
++                            ?.let { endpoint -> YouTube.related(endpoint).getOrNull()?.songs.orEmpty() }
++                            .orEmpty()
++                    }
++                }.awaitAll()
++            }
++            for (page in relatedPages) {
++                for (ytSong in page.take(10)) {
++                    database.song(ytSong.id).first()?.let { localSong ->
++                        if (!hideVideoSongs || !localSong.song.isVideo) {
++                            ytDownloadRelated.add(localSong)
++                        }
++                    }
++                }
++            }
++        }
++
++        if (ytSimilarSongs.isNotEmpty() || ytDownloadRelated.isNotEmpty()) {
+             // Merge enriched network songs into the already-visible local list
+             val existing = quickPicks.value.orEmpty()
+-            quickPicks.value = (existing + ytSimilarSongs)
++            quickPicks.value = RecommendationFilter
++                .keepUndownloaded(existing + ytSimilarSongs + ytDownloadRelated, downloadedIds) { it.id }
+                 .distinctBy { it.id }
+                 .shuffled()
+-                .take(20)
++                .take(quickPicksSize)
+             android.util.Log.d("QP_TIMING", "[Phase2] quickPicks enriched → ${quickPicks.value?.size} items total")
+         } else {
+             android.util.Log.w("QP_TIMING", "[Phase2] no new local matches from YT results — quickPicks unchanged")
+@@ -610,23 +769,50 @@ class HomeViewModel @Inject constructor(
+ 
+         val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
+ 
++        quickPicksSize = sectionSize(QuickPicksSizeKey)
++        dailyDiscoverSize = sectionSize(DailyDiscoverSizeKey)
++        coversAndRemixesSize = sectionSize(CoversAndRemixesSizeKey)
++        downloadedIds = runCatching {
++            DownloadedIds.completed(downloadUtil.downloads.value.mapValues { it.value.state })
++        }.onFailure {
++            android.util.Log.w("HomeViewModel", "download index unreadable; suggestions will not hide downloads", it)
++        }.getOrDefault(emptySet())
++
+         // DB-only — no network, publishes quickPicks instantly
+         getQuickPicksLocal()
+         android.util.Log.d("QP_TIMING", "[Phase1] getQuickPicksLocal() returned at ${System.currentTimeMillis() - t0}ms — quickPicks=${quickPicks.value?.size} items")
+ 
+         val tForgotten = System.currentTimeMillis()
+-        forgottenFavorites.value = database.forgottenFavorites().first()
+-            .filterVideoSongs(hideVideoSongs).shuffled().take(20)
++        forgottenFavorites.value = RecommendationFilter
++            .keepUndownloaded(database.forgottenFavorites().first(), downloadedIds) { it.id }
++            .filterVideoSongs(hideVideoSongs)
++            .shuffled()
++            .take(20)
+         android.util.Log.d("QP_TIMING", "[Phase1] forgottenFavorites loaded in ${System.currentTimeMillis() - tForgotten}ms")
+ 
+         val fromTimeStamp = System.currentTimeMillis() - 86400000L * 7 * 2
+         val tKeep = System.currentTimeMillis()
+-        val keepListeningSongs = database.mostPlayedSongs(fromTimeStamp, limit = 15, offset = 5).first()
+-            .filterVideoSongs(hideVideoSongs).shuffled().take(10)
+-        val keepListeningAlbums = database.mostPlayedAlbums(fromTimeStamp, limit = 8, offset = 2).first()
+-            .filter { it.album.thumbnailUrl != null }.shuffled().take(5)
++        val keepListeningSongs = RecommendationFilter
++            .keepUndownloaded(
++                database.mostPlayedSongs(fromTimeStamp, limit = 15, offset = 5).first(),
++                downloadedIds,
++            ) { it.id }
++            .filterVideoSongs(hideVideoSongs)
++            .shuffled()
++            .take(10)
++        val keepListeningAlbums = keepSuggestibleAlbums(
++            database.mostPlayedAlbums(fromTimeStamp, limit = 8, offset = 2).first()
++                .filter { it.album.thumbnailUrl != null },
++            downloadedIds,
++        )
++            .shuffled()
++            .take(5)
++        // Artists are not filtered: their ids are YouTube channel ids, which never appear in the download
++        // set, so the comparison could never drop anything.
+         val keepListeningArtists = database.mostPlayedArtists(fromTimeStamp).first()
+-            .filter { it.artist.isYouTubeArtist && it.artist.thumbnailUrl != null }.shuffled().take(5)
++            .filter { it.artist.isYouTubeArtist && it.artist.thumbnailUrl != null }
++            .shuffled()
++            .take(5)
+         keepListening.value = (keepListeningSongs + keepListeningAlbums + keepListeningArtists).shuffled()
+         android.util.Log.d("QP_TIMING", "[Phase1] keepListening loaded in ${System.currentTimeMillis() - tKeep}ms")
+ 
+@@ -719,7 +905,13 @@ class HomeViewModel @Inject constructor(
+                 }
+ 
+             val results = (artistDeferreds + songDeferreds + albumDeferreds).awaitAll()
+-            similarRecommendations.value = results.filterNotNull().shuffled()
++            similarRecommendations.value = results
++                .filterNotNull()
++                .map { recommendation ->
++                    recommendation.copy(items = keepSuggestible(recommendation.items, downloadedIds))
++                }
++                .filter { it.items.isNotEmpty() }
++                .shuffled()
+         }
+     }
+ 
+@@ -728,7 +920,7 @@ class HomeViewModel @Inject constructor(
+      * Because isLoading is already false, each section streams into the UI
+      * as its data arrives — no spinner blocking the user.
+      */
+-    private suspend fun loadNetworkDataPhase() {
++    private suspend fun loadNetworkDataPhase(generation: Int) {
+         val hideExplicit = context.dataStore.get(HideExplicitKey, false)
+         val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
+         val hideYoutubeShorts = context.dataStore.get(HideYoutubeShortsKey, false)
+@@ -742,17 +934,68 @@ class HomeViewModel @Inject constructor(
+             launch(Dispatchers.IO) { loadSimilarRecommendations() }
+             launch(Dispatchers.IO) {
+                 YouTube.home().onSuccess { page ->
+-                    val cnrSection = page.sections.find { it.title.contains("cover", true) && it.title.contains("remix", true) }
+-                    if (cnrSection != null) {
+-                        val filteredItems = cnrSection.items
+-                            .filterExplicit(hideExplicit)
+-                            .filterYoutubeShorts(hideYoutubeShorts)
+-                        if (filteredItems.isNotEmpty()) {
+-                            coversAndRemixes.value = cnrSection.copy(items = filteredItems)
++                    val cnrSection = page.sections.find {
++                        it.title.contains("cover", true) && it.title.contains("remix", true)
++                    }
++                    val shelfItems = cnrSection?.items.orEmpty()
++                        .filterExplicit(hideExplicit)
++                        .filterYoutubeShorts(hideYoutubeShorts)
++
++                    // Only songs reach the row (HomeScreen renders SongItem instances), so filter before pad:
++                    // otherwise pad counts items the row never shows and the row comes up short.
++                    val shelfFiltered = RecommendationFilter
++                        .keepUndownloaded(shelfItems, downloadedIds) { it.id }
++                        .filterIsInstance<SongItem>()
++                        .take(coversAndRemixesSize)
++
++                    if (cnrSection != null && shelfFiltered.isNotEmpty() && generation == loadGeneration && isActive) {
++                        // Publish the shelf at once. The top-up below can take several network round-trips
++                        // and must not hold back the rest of the feed. cnrSection cannot be null here: the
++                        // items came from it and keepUndownloaded never adds any.
++                        coversAndRemixes.value = cnrSection.copy(items = shelfFiltered)
++                    }
++
++                    if (shelfFiltered.size < coversAndRemixesSize) {
++                        launch(Dispatchers.IO) {
++                            // Downloads are the seeds first, then most-played songs fill the rest of the budget.
++                            val playedSeedIds = database.mostPlayedSongs(
++                                System.currentTimeMillis() - 86400000L * 7 * 4,
++                                limit = 3,
++                            ).first().map { it.id }
++                            val downloadSeedIds = RecommendationFilter.seedIds(
++                                playedSeeds = emptyList(),
++                                downloadedSongs = downloadedIds.toList(),
++                                maxDownloaded = 3,
++                            )
++                            val seedIds = (downloadSeedIds + playedSeedIds.filterNot { it in downloadSeedIds }).take(3)
++                            val seededItems = buildSeededCoversAndRemixes(seedIds)
++                            // The generic search is the last resort, and the local half must honour the same
++                            // explicit/shorts filters the shelf half does.
++                            val localItems = (if (seededItems.isEmpty()) {
++                                buildFallbackCoversAndRemixes()
++                            } else {
++                                seededItems
++                            })
++                                .filterIsInstance<SongItem>()
++                                .filterExplicit(hideExplicit)
++                                .filterYoutubeShorts(hideYoutubeShorts)
++                            val padded = RecommendationFilter.pad(
++                                remote = shelfFiltered,
++                                local = localItems,
++                                size = coversAndRemixesSize,
++                                downloadedIds = downloadedIds,
++                                idOf = { it.id },
++                            )
++                            if (padded.isNotEmpty() && generation == loadGeneration && isActive) {
++                                coversAndRemixes.value = HomePage.Section(
++                                    title = cnrSection?.title ?: "Covers and remixes",
++                                    label = cnrSection?.label,
++                                    thumbnail = cnrSection?.thumbnail,
++                                    endpoint = null,
++                                    items = padded,
++                                )
++                            }
+                         }
+-                    } else {
+-                        // Force fetch backend if not returned in initial home page natively
+-                        launch(Dispatchers.IO) { loadFallbackCoversAndRemixes() }
+                     }
+ 
+                     homePage.value = page.copy(
+@@ -785,6 +1028,8 @@ class HomeViewModel @Inject constructor(
+     }
+ 
+     private suspend fun load() {
++        // Claim a new generation so a top-up still running from an earlier load stops publishing.
++        val generation = ++loadGeneration
+         val t0 = System.currentTimeMillis()
+         android.util.Log.d("QP_TIMING", "========================================")
+         android.util.Log.d("QP_TIMING", "load() START — isLoading=true")
+@@ -798,34 +1043,44 @@ class HomeViewModel @Inject constructor(
+         android.util.Log.d("QP_TIMING", ">>> UI should now show Quick Picks at this point <<<")
+ 
+         // Phase 2: All network sections in parallel — streams in progressively
+-        loadNetworkDataPhase()
++        loadNetworkDataPhase(generation)
+         android.util.Log.d("QP_TIMING", "load() Phase2 complete at ${System.currentTimeMillis() - t0}ms — total load done")
+         android.util.Log.d("QP_TIMING", "========================================")
+     }
+ 
+     private val _isLoadingMore = MutableStateFlow(false)
+-    private suspend fun loadFallbackCoversAndRemixes() {
++
++    /** Builds covers/remixes candidates locally. Returns an empty list when the lookup fails. */
++    private suspend fun buildFallbackCoversAndRemixes(): List<YTItem> {
++        var built: List<YTItem> = emptyList()
+         YouTube.searchSummary("music covers and remixes").onSuccess { result ->
+             val songs = result.summaries.find { it.title == "Songs" }?.items?.filterIsInstance<SongItem>().orEmpty()
+             val videos = result.summaries.find { it.title == "Videos" }?.items?.filterIsInstance<SongItem>().orEmpty()
+-            
+-            // Aggressively strip out Podcasts which YT Search often incorrectly mixes in
+-            val combined = (songs + videos)
++            built = (songs + videos)
+                 .filter { !it.musicVideoType.toString().contains("PODCAST", ignoreCase = true) }
+-                .filter { (it.duration ?: 0) < 600 } // Exclude anything longer than 10 minutes
++                .filter { (it.duration ?: 0) < 600 }
+                 .distinctBy { it.id }
+                 .shuffled()
+-            
+-            if (combined.isNotEmpty()) {
+-                coversAndRemixes.value = HomePage.Section(
+-                    title = "Covers and remixes",
+-                    label = null,
+-                    thumbnail = null,
+-                    endpoint = null,
+-                    items = combined.take(20) // max 20 covers like other standard shelves
+-                )
+-            }
+         }.onFailure { reportException(it) }
++        return built
++    }
++
++    /** Runs one bounded search per seed, keeping only songs shorter than ten minutes. */
++    private suspend fun buildSeededCoversAndRemixes(seedIds: List<String>): List<YTItem> {
++        val found = mutableListOf<YTItem>()
++        for (songId in seedIds) {
++            val song = database.song(songId).first() ?: continue
++            val artist = song.artists.firstOrNull()?.name ?: continue
++            YouTube.searchSummary("$artist cover remix").onSuccess { result ->
++                val items = result.summaries.find { it.title == "Songs" }?.items?.filterIsInstance<SongItem>().orEmpty()
++                found.addAll(
++                    items
++                        .filter { !it.musicVideoType.toString().contains("PODCAST", ignoreCase = true) }
++                        .filter { (it.duration ?: 0) < 600 },
++                )
++            }.onFailure { reportException(it) }
++        }
++        return found.distinctBy { it.id }
+     }
+ 
+     fun loadMoreYouTubeItems(continuation: String?) {
+@@ -843,9 +1098,11 @@ class HomeViewModel @Inject constructor(
+ 
+             val cnrSection = nextSections.sections.find { it.title.contains("cover", true) && it.title.contains("remix", true) }
+             if (cnrSection != null && coversAndRemixes.value == null) {
+-                val filteredItems = cnrSection.items
++                val filteredItems = RecommendationFilter
++                    .keepUndownloaded(cnrSection.items, downloadedIds) { it.id }
+                     .filterExplicit(hideExplicit)
+                     .filterYoutubeShorts(hideYoutubeShorts)
++                    .take(coversAndRemixesSize)
+                 if (filteredItems.isNotEmpty()) {
+                     coversAndRemixes.value = cnrSection.copy(items = filteredItems)
+                 }
+diff --git a/app/src/main/res/values/local_recommendation_strings.xml b/app/src/main/res/values/local_recommendation_strings.xml
+new file mode 100644
+index 00000000..3484fa15
+--- /dev/null
++++ b/app/src/main/res/values/local_recommendation_strings.xml
+@@ -0,0 +1,14 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++  Strings for the "hide downloads and show more per section" patch.
++  Kept in their own file so the patch never has to touch vivi_strings.xml, which upstream edits on nearly
++  every release.
++-->
++<resources>
++    <string name="recommendations">Recommendations</string>
++    <string name="recommendations_quick_picks_items">Quick Picks items</string>
++    <string name="recommendations_daily_discover_items">Daily Discover items</string>
++    <string name="recommendations_covers_and_remixes_items">Covers &amp; Remixes items</string>
++    <string name="recommendations_items_hint">Items per section, 10 to 200. Higher counts can mean more network lookups.</string>
++    <string name="recommendations_items_invalid">Enter a whole number between 10 and 200.</string>
++</resources>
+diff --git a/app/src/test/kotlin/com/music/vivi/playback/DownloadedIdsTest.kt b/app/src/test/kotlin/com/music/vivi/playback/DownloadedIdsTest.kt
+new file mode 100644
+index 00000000..30ca45ce
+--- /dev/null
++++ b/app/src/test/kotlin/com/music/vivi/playback/DownloadedIdsTest.kt
+@@ -0,0 +1,36 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import androidx.media3.exoplayer.offline.Download
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class DownloadedIdsTest {
++
++    @Test
++    fun `completed maps Media3 states onto the finished ids`() {
++        val states = mapOf(
++            "done" to RecommendationFilter.STATE_COMPLETED,
++            "queued" to 0,
++            "stopped" to 1,
++            "running" to 2,
++            "failed" to 4,
++        )
++
++        assertEquals(setOf("done"), DownloadedIds.completed(states))
++    }
++
++    @Test
++    fun `completed of an empty index is empty`() {
++        assertEquals(emptySet<String>(), DownloadedIds.completed(emptyMap()))
++    }
++
++    @Test
++    fun `the restated completed state matches Media3`() {
++        assertEquals(Download.STATE_COMPLETED, RecommendationFilter.STATE_COMPLETED)
++    }
++}
+diff --git a/app/src/test/kotlin/com/music/vivi/playback/RecommendationFilterTest.kt b/app/src/test/kotlin/com/music/vivi/playback/RecommendationFilterTest.kt
+new file mode 100644
+index 00000000..849a4b79
+--- /dev/null
++++ b/app/src/test/kotlin/com/music/vivi/playback/RecommendationFilterTest.kt
+@@ -0,0 +1,157 @@
++/**
++ * vivimusic Project (C) 2026
++ * Licensed under GPL-3.0 | See git history for contributors
++ */
++
++package com.music.vivi.playback
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class RecommendationFilterTest {
++
++    @Test
++    fun `clampSize keeps values inside the supported range`() {
++        assertEquals(10, RecommendationFilter.clampSize(0))
++        assertEquals(10, RecommendationFilter.clampSize(10))
++        assertEquals(50, RecommendationFilter.clampSize(50))
++        assertEquals(200, RecommendationFilter.clampSize(200))
++        assertEquals(200, RecommendationFilter.clampSize(9_999))
++    }
++
++    @Test
++    fun `keepUndownloaded drops downloaded ids and keeps the order`() {
++        val items = listOf("a", "b", "c", "d")
++
++        val kept = RecommendationFilter.keepUndownloaded(items, setOf("b", "d")) { it }
++
++        assertEquals(listOf("a", "c"), kept)
++    }
++
++    @Test
++    fun `keepUndownloaded with no downloads keeps everything`() {
++        val items = listOf("a", "b")
++
++        val kept = RecommendationFilter.keepUndownloaded(items, emptySet()) { it }
++
++        assertEquals(items, kept)
++    }
++
++
++
++    @Test
++    fun `completedIds keeps only finished downloads`() {
++        val snapshots = listOf(
++            RecommendationFilter.DownloadSnapshot("finished", RecommendationFilter.STATE_COMPLETED),
++            RecommendationFilter.DownloadSnapshot("queued", 0),
++            RecommendationFilter.DownloadSnapshot("downloading", 2),
++            RecommendationFilter.DownloadSnapshot("stopped", 1),
++        )
++
++        assertEquals(setOf("finished"), RecommendationFilter.completedIds(snapshots))
++    }
++
++    @Test
++    fun `keepCollection keeps a collection whose tracks are not all downloaded`() {
++        val downloaded = setOf("t1", "t2")
++
++        assertEquals(true, RecommendationFilter.keepCollection(listOf("t1", "t2", "t3"), downloaded))
++        assertEquals(true, RecommendationFilter.keepCollection(listOf("t3"), downloaded))
++    }
++
++    @Test
++    fun `keepCollection hides only a fully downloaded collection`() {
++        val downloaded = setOf("t1", "t2")
++
++        assertEquals(false, RecommendationFilter.keepCollection(listOf("t1", "t2"), downloaded))
++    }
++
++    @Test
++    fun `keepCollection keeps a collection whose membership is unknown`() {
++        assertEquals(true, RecommendationFilter.keepCollection(emptyList(), setOf("t1")))
++    }
++
++    @Test
++    fun `seedIds appends downloaded songs that are not already seeds`() {
++        val seeds = RecommendationFilter.seedIds(
++            playedSeeds = listOf("played1", "played2"),
++            downloadedSongs = listOf("played2", "down1", "down2"),
++            maxDownloaded = RecommendationFilter.MAX_DOWNLOAD_SEEDS,
++        )
++
++        assertEquals(listOf("played1", "played2", "down1", "down2"), seeds)
++    }
++
++    @Test
++    fun `seedIds caps the downloaded additions`() {
++        val seeds = RecommendationFilter.seedIds(
++            playedSeeds = listOf("played1"),
++            downloadedSongs = listOf("d1", "d2", "d3", "d4", "d5", "d6", "d7"),
++            maxDownloaded = RecommendationFilter.MAX_DOWNLOAD_SEEDS,
++        )
++
++        assertEquals(listOf("played1", "d1", "d2", "d3", "d4", "d5"), seeds)
++    }
++
++    @Test
++    fun `seedIds returns the played seeds unchanged when nothing is downloaded`() {
++        val seeds = RecommendationFilter.seedIds(listOf("a", "b"), emptyList(), RecommendationFilter.MAX_DOWNLOAD_SEEDS)
++
++        assertEquals(listOf("a", "b"), seeds)
++    }
++
++    @Test
++    fun `pad prefers remote items, then local ones, without duplicates`() {
++        val padded = RecommendationFilter.pad(
++            remote = listOf("r1", "r2", "shared"),
++            local = listOf("l1", "shared", "l2"),
++            size = 10,
++            downloadedIds = emptySet(),
++            idOf = { it },
++        )
++
++        assertEquals(listOf("r1", "r2", "shared", "l1", "l2"), padded)
++    }
++
++    @Test
++    fun `pad caps the row at the configured size`() {
++        val remote = (1..12).map { "r$it" }
++
++        val padded = RecommendationFilter.pad(
++            remote = remote,
++            local = emptyList(),
++            size = 10,
++            downloadedIds = emptySet(),
++            idOf = { it },
++        )
++
++        assertEquals(10, padded.size)
++        assertEquals(remote.take(10), padded)
++    }
++
++    @Test
++    fun `pad filters downloads out of both halves and respects the size`() {
++        val padded = RecommendationFilter.pad(
++            remote = listOf("r1", "owned"),
++            local = listOf("l1", "l2", "l3"),
++            size = 10,
++            downloadedIds = setOf("owned", "l2"),
++            idOf = { it },
++        )
++
++        assertEquals(listOf("r1", "l1", "l3"), padded)
++    }
++
++    @Test
++    fun `pad returns nothing when everything is downloaded`() {
++        val padded = RecommendationFilter.pad(
++            remote = listOf("a"),
++            local = listOf("b"),
++            size = 50,
++            downloadedIds = setOf("a", "b"),
++            idOf = { it },
++        )
++
++        assertEquals(emptyList<String>(), padded)
++    }
++}
