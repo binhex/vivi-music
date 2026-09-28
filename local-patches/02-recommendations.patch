@@ -1,5 +1,5 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index a8734160..97dba3fb 100644
+index a873416..97dba3f 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -332,7 +332,7 @@ dependencies {
@@ -30,7 +30,7 @@ index a8734160..97dba3fb 100644
          }
          verify {
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
-index 10fcadf6..910d238b 100644
+index 10fcadf..910d238 100644
 --- a/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadRecovery.kt
 @@ -62,7 +62,7 @@ internal data class DownloadRecoveryObservation(
@@ -44,7 +44,7 @@ index 10fcadf6..910d238b 100644
  private const val MEDIA3_STATE_RESTARTING = 7
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt b/app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt
 new file mode 100644
-index 00000000..25b50dea
+index 0000000..25b50de
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/DownloadedIds.kt
 @@ -0,0 +1,23 @@
@@ -73,7 +73,7 @@ index 00000000..25b50dea
 +}
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt b/app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt
 new file mode 100644
-index 00000000..7e4c6c58
+index 0000000..7e4c6c5
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/LocalRecommendationPrefs.kt
 @@ -0,0 +1,22 @@
@@ -101,10 +101,10 @@ index 00000000..7e4c6c58
 +val CoversAndRemixesSizeKey = intPreferencesKey("localRecommendation.coversAndRemixesSize")
 diff --git a/app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt b/app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt
 new file mode 100644
-index 00000000..f169acc9
+index 0000000..898fb89
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/playback/RecommendationFilter.kt
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,131 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -123,6 +123,14 @@ index 00000000..f169acc9
 +object RecommendationFilter {
 +    /** Smallest and largest number of items a section may be configured to show. */
 +    const val MIN_SECTION_SIZE = 10
++    /** Fewest seeds the covers row may search from; the old flat value. */
++    const val LEGACY_COVERS_SEEDS = 3
++
++    /** Most seeds the covers row may search from, so a large row cannot fan out without limit. */
++    const val MAX_COVERS_SEEDS = 10
++
++    /** Floor for the Quick Picks candidate pool, so the row never shrinks below its old size. */
++    const val LEGACY_QUICK_PICKS_POOL = 20
 +    const val MAX_SECTION_SIZE = 200
 +
 +    /** Item count every configurable section uses until the user changes it. */
@@ -140,6 +148,40 @@ index 00000000..f169acc9
 +
 +    /** One download as the adapter sees it: the item id and Media3's state code. */
 +    data class DownloadSnapshot(val id: String, val state: Int)
++
++    /** How many candidates Quick Picks should draw per local source for a configured row size.
++     *
++     * The pool used to be a flat handful of items, so a target of 50 could never be reached however
++     * the setting was changed. Keep the old floor, then follow the configured size.
++     */
++    fun quickPicksPoolCap(size: Int): Int = maxOf(clampSize(size), LEGACY_QUICK_PICKS_POOL)
++
++    /** Say whether a candidate list would grow a row that is already published.
++     *
++     * A pure size predicate: it says nothing about freshness, so callers pass it to mayReplaceRow
++     * together with their own generation check before replacing a row.
++     */
++    fun improvesRow(currentCount: Int, candidateCount: Int): Boolean =
++        candidateCount > currentCount
++
++    /** How many seeds the covers row searches from, following the configured row size.
++     *
++     * One search per seed, so this is the row's network budget: the old flat three, growing with the
++     * size the user asked for and capped so a 200-item row does not fan out indefinitely.
++     */
++    fun coversSeedCount(size: Int): Int =
++        (size / 5).coerceIn(LEGACY_COVERS_SEEDS, MAX_COVERS_SEEDS)
++
++    /** Say whether a load may publish a result over the row that is currently on screen.
++     *
++     * `currentGeneration` must be the generation of the load that is still current, not the generation
++     * that last wrote this row: a row whose shelf never arrived (or arrived empty) has no publisher to
++     * match, and comparing against one stranded every padded result forever. Both halves matter -
++     * equal generations mean no newer load has taken over, so a superseded load can never overwrite
++     * fresher data, and `improves` keeps a late result from shrinking a row that is already longer.
++     */
++    fun mayReplaceRow(generation: Int, currentGeneration: Int, improves: Boolean): Boolean =
++        generation == currentGeneration && improves
 +
 +    /** Clamp a configured section size into the supported range. */
 +    fun clampSize(value: Int): Int = value.coerceIn(MIN_SECTION_SIZE, MAX_SECTION_SIZE)
@@ -195,7 +237,7 @@ index 00000000..f169acc9
 +        items.filterNot { idOf(it) in downloadedIds }
 +}
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt
-index cecfd1cb..c160b598 100644
+index cecfd1c..c160b59 100644
 --- a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/ContentSettings.kt
 @@ -1271,6 +1271,7 @@ fun ContentSettings(
@@ -208,7 +250,7 @@ index cecfd1cb..c160b598 100644
          ExpressiveSettingGroup(
 diff --git a/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt
 new file mode 100644
-index 00000000..e07343ad
+index 0000000..e07343a
 --- /dev/null
 +++ b/app/src/main/kotlin/com/music/vivi/ui/screens/settings/LocalRecommendationSettings.kt
 @@ -0,0 +1,126 @@
@@ -339,7 +381,7 @@ index 00000000..e07343ad
 +    }
 +}
 diff --git a/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt b/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt
-index 5f9fc67a..2b80e7c1 100644
+index 5f9fc67..d43484d 100644
 --- a/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt
 +++ b/app/src/main/kotlin/com/music/vivi/viewmodels/HomeViewModel.kt
 @@ -6,6 +6,7 @@
@@ -469,7 +511,8 @@ index 5f9fc67a..2b80e7c1 100644
 +
 +        var seeds = likedSongs.shuffled().distinctBy { it.id }.take(seedBudget)
          android.util.Log.d("DailyDiscover", "Liked seeds count: ${seeds.size}")
-         
+-        
++
          if (seeds.isEmpty()) {
              // First fallback: Recent listening history
 -            seeds = database.events().first().map { it.song }.shuffled().distinctBy { it.id }.take(5)
@@ -556,7 +599,7 @@ index 5f9fc67a..2b80e7c1 100644
 +                val forgotten = RecommendationFilter
 +                    .keepUndownloaded(database.forgottenFavorites().first(), downloadedIds) { it.id }
 +                    .filterVideoSongs(hideVideoSongs)
-+                    .take(8)
++                    .take(RecommendationFilter.quickPicksPoolCap(quickPicksSize))
                  android.util.Log.d("QP_TIMING", "[Phase1] forgottenFavorites DB query: ${System.currentTimeMillis() - tForgotten}ms | count=${forgotten.size}")
  
                  // Only local sources — no network calls here
@@ -772,7 +815,7 @@ index 5f9fc67a..2b80e7c1 100644
          val hideExplicit = context.dataStore.get(HideExplicitKey, false)
          val hideVideoSongs = context.dataStore.get(HideVideoSongsKey, false)
          val hideYoutubeShorts = context.dataStore.get(HideYoutubeShortsKey, false)
-@@ -742,17 +934,68 @@ class HomeViewModel @Inject constructor(
+@@ -742,17 +934,79 @@ class HomeViewModel @Inject constructor(
              launch(Dispatchers.IO) { loadSimilarRecommendations() }
              launch(Dispatchers.IO) {
                  YouTube.home().onSuccess { page ->
@@ -809,14 +852,15 @@ index 5f9fc67a..2b80e7c1 100644
 +                            // Downloads are the seeds first, then most-played songs fill the rest of the budget.
 +                            val playedSeedIds = database.mostPlayedSongs(
 +                                System.currentTimeMillis() - 86400000L * 7 * 4,
-+                                limit = 3,
++                                limit = RecommendationFilter.coversSeedCount(coversAndRemixesSize),
 +                            ).first().map { it.id }
 +                            val downloadSeedIds = RecommendationFilter.seedIds(
 +                                playedSeeds = emptyList(),
 +                                downloadedSongs = downloadedIds.toList(),
-+                                maxDownloaded = 3,
++                                maxDownloaded = RecommendationFilter.coversSeedCount(coversAndRemixesSize),
 +                            )
-+                            val seedIds = (downloadSeedIds + playedSeedIds.filterNot { it in downloadSeedIds }).take(3)
++                            val seedIds = (downloadSeedIds + playedSeedIds.filterNot { it in downloadSeedIds })
++                                .take(RecommendationFilter.coversSeedCount(coversAndRemixesSize))
 +                            val seededItems = buildSeededCoversAndRemixes(seedIds)
 +                            // The generic search is the last resort, and the local half must honour the same
 +                            // explicit/shorts filters the shelf half does.
@@ -835,7 +879,17 @@ index 5f9fc67a..2b80e7c1 100644
 +                                downloadedIds = downloadedIds,
 +                                idOf = { it.id },
 +                            )
-+                            if (padded.isNotEmpty() && generation == loadGeneration && isActive) {
++                            if (
++                                isActive &&
++                                RecommendationFilter.mayReplaceRow(
++                                    generation = generation,
++                                    currentGeneration = loadGeneration,
++                                    improves = RecommendationFilter.improvesRow(
++                                        coversAndRemixes.value?.items?.size ?: 0,
++                                        padded.size,
++                                    ),
++                                )
++                            ) {
 +                                coversAndRemixes.value = HomePage.Section(
 +                                    title = cnrSection?.title ?: "Covers and remixes",
 +                                    label = cnrSection?.label,
@@ -851,7 +905,7 @@ index 5f9fc67a..2b80e7c1 100644
                      }
  
                      homePage.value = page.copy(
-@@ -785,6 +1028,8 @@ class HomeViewModel @Inject constructor(
+@@ -785,6 +1039,8 @@ class HomeViewModel @Inject constructor(
      }
  
      private suspend fun load() {
@@ -860,7 +914,7 @@ index 5f9fc67a..2b80e7c1 100644
          val t0 = System.currentTimeMillis()
          android.util.Log.d("QP_TIMING", "========================================")
          android.util.Log.d("QP_TIMING", "load() START — isLoading=true")
-@@ -798,34 +1043,44 @@ class HomeViewModel @Inject constructor(
+@@ -798,34 +1054,44 @@ class HomeViewModel @Inject constructor(
          android.util.Log.d("QP_TIMING", ">>> UI should now show Quick Picks at this point <<<")
  
          // Phase 2: All network sections in parallel — streams in progressively
@@ -921,7 +975,7 @@ index 5f9fc67a..2b80e7c1 100644
      }
  
      fun loadMoreYouTubeItems(continuation: String?) {
-@@ -843,9 +1098,11 @@ class HomeViewModel @Inject constructor(
+@@ -843,9 +1109,11 @@ class HomeViewModel @Inject constructor(
  
              val cnrSection = nextSections.sections.find { it.title.contains("cover", true) && it.title.contains("remix", true) }
              if (cnrSection != null && coversAndRemixes.value == null) {
@@ -936,7 +990,7 @@ index 5f9fc67a..2b80e7c1 100644
                  }
 diff --git a/app/src/main/res/values/local_recommendation_strings.xml b/app/src/main/res/values/local_recommendation_strings.xml
 new file mode 100644
-index 00000000..3484fa15
+index 0000000..3484fa1
 --- /dev/null
 +++ b/app/src/main/res/values/local_recommendation_strings.xml
 @@ -0,0 +1,14 @@
@@ -956,7 +1010,7 @@ index 00000000..3484fa15
 +</resources>
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/DownloadedIdsTest.kt b/app/src/test/kotlin/com/music/vivi/playback/DownloadedIdsTest.kt
 new file mode 100644
-index 00000000..30ca45ce
+index 0000000..30ca45c
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/DownloadedIdsTest.kt
 @@ -0,0 +1,36 @@
@@ -998,10 +1052,10 @@ index 00000000..30ca45ce
 +}
 diff --git a/app/src/test/kotlin/com/music/vivi/playback/RecommendationFilterTest.kt b/app/src/test/kotlin/com/music/vivi/playback/RecommendationFilterTest.kt
 new file mode 100644
-index 00000000..849a4b79
+index 0000000..61c97b0
 --- /dev/null
 +++ b/app/src/test/kotlin/com/music/vivi/playback/RecommendationFilterTest.kt
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,194 @@
 +/**
 + * vivimusic Project (C) 2026
 + * Licensed under GPL-3.0 | See git history for contributors
@@ -1157,5 +1211,42 @@ index 00000000..849a4b79
 +        )
 +
 +        assertEquals(emptyList<String>(), padded)
++    }
++
++    @Test
++    fun `a top-up may replace the row only when it adds items`() {
++        assertEquals(true, RecommendationFilter.improvesRow(currentCount = 20, candidateCount = 50))
++        assertEquals(false, RecommendationFilter.improvesRow(currentCount = 50, candidateCount = 20))
++        assertEquals(false, RecommendationFilter.improvesRow(currentCount = 20, candidateCount = 20))
++    }
++
++    @Test
++    fun `quick picks pool cap follows the configured size but never shrinks below the old size`() {
++        assertEquals(20, RecommendationFilter.quickPicksPoolCap(10))
++        assertEquals(50, RecommendationFilter.quickPicksPoolCap(50))
++        assertEquals(200, RecommendationFilter.quickPicksPoolCap(200))
++    }
++
++    @Test
++    fun `covers seeds grow with the configured size up to the cap`() {
++        assertEquals(3, RecommendationFilter.coversSeedCount(10))
++        assertEquals(10, RecommendationFilter.coversSeedCount(50))
++        assertEquals(10, RecommendationFilter.coversSeedCount(200))
++    }
++
++    @Test
++    fun `a covers top-up may replace the row only while its own load is the newest writer`() {
++        assertEquals(
++            true,
++            RecommendationFilter.mayReplaceRow(generation = 2, currentGeneration = 2, improves = true),
++        )
++        assertEquals(
++            false,
++            RecommendationFilter.mayReplaceRow(generation = 1, currentGeneration = 2, improves = true),
++        )
++        assertEquals(
++            false,
++            RecommendationFilter.mayReplaceRow(generation = 2, currentGeneration = 2, improves = false),
++        )
 +    }
 +}
