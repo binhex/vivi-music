@@ -276,14 +276,24 @@ git commit -m "local: sync upstream <short-sha> into the fork tree"
 Two commands answer it, and both must pass:
 
 ```bash
-git diff --name-status --no-renames upstream/main HEAD | grep -vE '^A'   # must print nothing
-local-patches/apply.sh --check                                          # must print OK for every patch
+local-patches/apply.sh --check                              # must print OK for every patch
+git diff --name-only --diff-filter=DMTUXB upstream/main HEAD   # must print nothing
 ```
 
-The first says the tree is upstream plus our additions: every difference has to be an `A`dd. The second
-says the patches still apply to it. The second is the one that bites - when the tree falls behind
-upstream the patches go stale against it even though they still apply to upstream itself, so a checkout
+The first says the patches still apply to this tree. The second says no upstream file underneath this
+tree has been changed or deleted, which is the lag that used to go unnoticed: when the tree falls
+behind, the patches go stale against it even though they still apply to upstream itself, so a checkout
 of this fork quietly stops reproducing what CI builds.
+
+The weekly check goes one step further: every difference must not only be an addition, it must be an
+addition under a path this repo owns (`local-patches/**`, `docs/agent/**` and its two workflows). That
+is what catches an upstream file that upstream deleted while this tree still carries it, which a plain
+"must be an `A`dd" test would read as a clean tree:
+
+```bash
+git diff --name-only -z --no-renames upstream/main HEAD \
+  | tr '\0' '\n' | grep -vE '^(local-patches/|docs/agent/|\.github/workflows/(local-build|upstream-drift)\.yml$)'   # must print nothing
+```
 
 ### Rebasing a patch onto new upstream
 
@@ -329,6 +339,13 @@ cd /tmp/vivi-check && /path/to/this/repo/local-patches/apply.sh --check
   now reports when that stops being true. Upstream carries a stray root file `et --hard 33c82f9`
   (committed there by accident in June 2026); this repo keeps it, because deleting it would be the one
   change that is not an addition.
+- The freshness check owns the paths this repo may add: `local-patches/**`, `docs/agent/**` and the two
+  workflows in `.github/workflows/`. A file that appears under any other path is reported as an
+  unexpected addition, which is also how it catches an upstream file that upstream deleted while this
+  tree still carries it. With Issues switched off - this fork's state - a lag reaches nobody by itself: it
+  shows up in the run summary and as a warning annotation on that run. The check also hard-codes the
+  upstream repository and branch (`github.com/vivizzz007/vivi-music`, `main`) and this fork's default
+  branch, so a rename of any of those means editing `.github/workflows/upstream-drift.yml`.
 - GitHub disables scheduled workflows after 60 days without repository activity. If the weekly drift
   check stops running, re-enable it from the Actions tab.
 - On-device checklist for patch 01: pick a folder and confirm the setting immediately reads
