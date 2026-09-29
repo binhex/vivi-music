@@ -103,6 +103,8 @@ jobs:
 
       - name: Compare the trees
         id: tree
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           upstream_sha="$(git rev-parse --short upstream/main)"
@@ -112,10 +114,14 @@ jobs:
           # Trees are compared, never history, so a depth-1 fetch is enough.
           git diff --name-status --no-renames upstream/main HEAD >"${RUNNER_TEMP}/tree-diff.txt"
           offending="$(grep -cvE '^A' "${RUNNER_TEMP}/tree-diff.txt" || true)"
+          # A repository with Issues switched off must not turn a lag into a red run, so the issue
+          # channel is optional and asked for once.
+          issues_enabled="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' 2>/dev/null || echo false)"
           {
             echo "upstream_sha=${upstream_sha}"
             echo "fork_sha=${fork_sha}"
             echo "offending=${offending}"
+            echo "issues_enabled=${issues_enabled}"
           } >>"${GITHUB_OUTPUT}"
           echo "Fork ${fork_sha} vs upstream ${upstream_sha}: ${offending} non-additive entries"
           grep -vE '^A' "${RUNNER_TEMP}/tree-diff.txt" | head -20 || true
@@ -129,6 +135,7 @@ jobs:
           forked="${{ inputs.fork_ref || 'main' }}"
           upstream_sha="${{ steps.tree.outputs.upstream_sha }}"
           offending="${{ steps.tree.outputs.offending }}"
+          issues_enabled="${{ steps.tree.outputs.issues_enabled }}"
           {
             echo "### Fork tree is behind upstream main"
             echo
@@ -145,12 +152,18 @@ jobs:
             echo "\`local-patches/README.md\`."
           } >>"${GITHUB_STEP_SUMMARY}"
           echo "::warning::Fork tree (${forked}) differs from upstream main (${upstream_sha}) in ${offending} non-additive entries"
+          if [[ "${issues_enabled}" != "true" ]]; then
+            echo "Issues are disabled on ${GITHUB_REPOSITORY}, so this lag is reported in this summary only." >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
           body="The fork tree (\`${forked}\`) is no longer upstream main (\`${upstream_sha}\`) plus the files this repo adds: ${offending} non-additive entries. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search '"Fork tree is behind upstream main" in:title' --json number --jq '.[0].number // empty')"
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search '"Fork tree is behind upstream main" in:title' --json number --jq '.[0].number // empty' || true)"
           if [[ -n "${existing}" ]]; then
-            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}" \
+              || echo "::warning::could not comment on the lag issue"
           else
-            gh issue create --repo "${GITHUB_REPOSITORY}" --title "Fork tree is behind upstream main" --body "${body}"
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "Fork tree is behind upstream main" --body "${body}" \
+              || echo "::warning::could not create the lag issue"
           fi
 
       - name: Note a current tree and close any open lag issue
@@ -161,9 +174,14 @@ jobs:
           set -euo pipefail
           forked="${{ inputs.fork_ref || 'main' }}"
           upstream_sha="${{ steps.tree.outputs.upstream_sha }}"
+          issues_enabled="${{ steps.tree.outputs.issues_enabled }}"
           echo "Fork tree (${forked}) is upstream ${upstream_sha} plus the files this repo adds." >>"${GITHUB_STEP_SUMMARY}"
-          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search '"Fork tree is behind upstream main" in:title' --json number --jq '.[0].number // empty')"
+          if [[ "${issues_enabled}" != "true" ]]; then
+            exit 0
+          fi
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search '"Fork tree is behind upstream main" in:title' --json number --jq '.[0].number // empty' || true)"
           if [[ -n "${existing}" ]]; then
             gh issue close "${existing}" --repo "${GITHUB_REPOSITORY}" \
-              --comment "Fork tree is current with upstream \`${upstream_sha}\` again."
+              --comment "Fork tree is current with upstream \`${upstream_sha}\` again." \
+              || echo "::warning::could not close the lag issue"
           fi
