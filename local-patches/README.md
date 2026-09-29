@@ -252,7 +252,43 @@ patch 02 - `LocalRecommendationPrefs`, `LocalRecommendationSettings` and the `Ho
 
 ## Updating for a new upstream release
 
-Work in a clone of upstream, with the patch applied on a normal branch:
+This fork's tree is upstream `main` plus the files this repository adds: `local-patches/**`,
+`docs/agent/**` and its two workflows in `.github/workflows/`. Nothing here ever edits an upstream file,
+which is why the merge below cannot conflict.
+
+One-time setup, in your clone of this fork:
+
+```bash
+git remote add upstream https://github.com/vivizzz007/vivi-music.git
+git remote set-url --push upstream no_push    # push can never reach upstream
+```
+
+Then, after upstream releases:
+
+```bash
+git fetch --no-tags upstream main
+git merge --no-commit upstream/main          # conflict-free: we add files, upstream owns the rest
+git commit -m "local: sync upstream <short-sha> into the fork tree"
+```
+
+### Is the tree still current?
+
+Two commands answer it, and both must pass:
+
+```bash
+git diff --name-status --no-renames upstream/main HEAD | grep -vE '^A'   # must print nothing
+local-patches/apply.sh --check                                          # must print OK for every patch
+```
+
+The first says the tree is upstream plus our additions: every difference has to be an `A`dd. The second
+says the patches still apply to it. The second is the one that bites - when the tree falls behind
+upstream the patches go stale against it even though they still apply to upstream itself, so a checkout
+of this fork quietly stops reproducing what CI builds.
+
+### Rebasing a patch onto new upstream
+
+Only needed when `apply.sh --check` fails, which means upstream moved a line one of the patches depends
+on. Work in a clone of upstream with the patch applied on a normal branch:
 
 ```bash
 # once
@@ -289,6 +325,10 @@ cd /tmp/vivi-check && /path/to/this/repo/local-patches/apply.sh --check
 
 ## Notes
 
+- The fork's tree is always *upstream plus the files this repo adds*, and the weekly Upstream Drift Check
+  now reports when that stops being true. Upstream carries a stray root file `et --hard 33c82f9`
+  (committed there by accident in June 2026); this repo keeps it, because deleting it would be the one
+  change that is not an addition.
 - GitHub disables scheduled workflows after 60 days without repository activity. If the weekly drift
   check stops running, re-enable it from the Actions tab.
 - On-device checklist for patch 01: pick a folder and confirm the setting immediately reads
