@@ -1,14 +1,24 @@
 name: Upstream Drift Check
 
-# Cheap weekly canary: do local-patches/*.patch still apply to upstream main?
+# Two cheap weekly canaries:
+#   1. drift     - do local-patches/*.patch still apply to upstream main?
+#   2. freshness - is this fork's tree still upstream main plus the files this repo adds?
 #
-# A red run means upstream moved one of the few lines a patch touches (or added a file with the same
-# name) - the moment to rebase the patch, rather than finding out when a build is needed.
+# A red drift run means upstream moved one of the few lines a patch touches (or added a file with the
+# same name) - the moment to rebase the patch, rather than finding out when a build is needed.
+# A freshness warning means this tree has fallen behind upstream. It never fails the run: Local Patch
+# Build compiles upstream main plus these patches, so a lag cannot affect a built APK - which is
+# exactly why a lag can hide for weeks.
 
 on:
   schedule:
     - cron: '0 6 * * 1'
   workflow_dispatch:
+    inputs:
+      fork_ref:
+        description: Ref of this fork to compare with upstream main
+        type: string
+        default: main
 
 permissions:
   contents: read
@@ -74,3 +84,86 @@ jobs:
         run: |
           echo "Patches no longer apply to upstream main - see the job summary." >&2
           exit 1
+
+  freshness:
+    name: Fork tree is current with upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out this fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.fork_ref || 'main' }}
+
+      - name: Fetch upstream main
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/vivizzz007/vivi-music.git
+          git fetch --no-tags --depth=1 upstream main
+
+      - name: Compare the trees
+        id: tree
+        run: |
+          set -euo pipefail
+          upstream_sha="$(git rev-parse --short upstream/main)"
+          fork_sha="$(git rev-parse --short HEAD)"
+          # Every difference must be a file this repo adds. A modified or deleted upstream file means
+          # the tree is no longer "upstream main + our additions" - normally because it lags upstream.
+          # Trees are compared, never history, so a depth-1 fetch is enough.
+          git diff --name-status --no-renames upstream/main HEAD >"${RUNNER_TEMP}/tree-diff.txt"
+          offending="$(grep -cvE '^A' "${RUNNER_TEMP}/tree-diff.txt" || true)"
+          {
+            echo "upstream_sha=${upstream_sha}"
+            echo "fork_sha=${fork_sha}"
+            echo "offending=${offending}"
+          } >>"${GITHUB_OUTPUT}"
+          echo "Fork ${fork_sha} vs upstream ${upstream_sha}: ${offending} non-additive entries"
+          grep -vE '^A' "${RUNNER_TEMP}/tree-diff.txt" | head -20 || true
+
+      - name: Report a lagging tree
+        if: steps.tree.outputs.offending != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          forked="${{ inputs.fork_ref || 'main' }}"
+          upstream_sha="${{ steps.tree.outputs.upstream_sha }}"
+          offending="${{ steps.tree.outputs.offending }}"
+          {
+            echo "### Fork tree is behind upstream main"
+            echo
+            echo "\`git diff --name-status upstream/main ${forked}\` reports **${offending}** entries that are"
+            echo "not files this repo adds, so the tree is no longer \`upstream main + our additions\`."
+            echo
+            echo "Upstream tip: \`${upstream_sha}\`. First 20 entries:"
+            echo
+            echo '```'
+            grep -vE '^A' "${RUNNER_TEMP}/tree-diff.txt" | head -20
+            echo '```'
+            echo
+            echo "Sync with \`git fetch upstream main && git merge --no-commit upstream/main\` - see"
+            echo "\`local-patches/README.md\`."
+          } >>"${GITHUB_STEP_SUMMARY}"
+          echo "::warning::Fork tree (${forked}) differs from upstream main (${upstream_sha}) in ${offending} non-additive entries"
+          body="The fork tree (\`${forked}\`) is no longer upstream main (\`${upstream_sha}\`) plus the files this repo adds: ${offending} non-additive entries. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search '"Fork tree is behind upstream main" in:title' --json number --jq '.[0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "Fork tree is behind upstream main" --body "${body}"
+          fi
+
+      - name: Note a current tree and close any open lag issue
+        if: steps.tree.outputs.offending == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          forked="${{ inputs.fork_ref || 'main' }}"
+          upstream_sha="${{ steps.tree.outputs.upstream_sha }}"
+          echo "Fork tree (${forked}) is upstream ${upstream_sha} plus the files this repo adds." >>"${GITHUB_STEP_SUMMARY}"
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search '"Fork tree is behind upstream main" in:title' --json number --jq '.[0].number // empty')"
+          if [[ -n "${existing}" ]]; then
+            gh issue close "${existing}" --repo "${GITHUB_REPOSITORY}" \
+              --comment "Fork tree is current with upstream \`${upstream_sha}\` again."
+          fi
